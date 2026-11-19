@@ -3432,6 +3432,7 @@ cuda = [
 ]
 cvat = [
     { name = "cvat-sdk" },
+    { name = "python-dotenv" },
 ]
 export = [
     { name = "onnx" },
@@ -3476,6 +3477,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=10,<14" },
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "pycocotools", specifier = ">=2.0.8,<3" },
+    { name = "python-dotenv", marker = "extra == 'cvat'", specifier = ">=1,<2" },
     { name = "python-dotenv", marker = "extra == 'mlflow'", specifier = ">=1,<2" },
     { name = "tabulate", specifier = ">=0.9,<1" },
     { name = "tensorboard", specifier = ">=2.18,<3" },

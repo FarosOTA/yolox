@@ -32,7 +32,7 @@ Documentation = "https://yolox.readthedocs.io"
 Source = "https://github.com/markosnarinian/YOLOX"
 
 [project.optional-dependencies]
-cvat = ["cvat-sdk>=2.74.1,<2.75"]
+cvat = ["cvat-sdk>=2.74.1,<2.75", "python-dotenv>=1,<2"]
 export = ["onnx>=1.17,<2", "onnxsim>=0.4.36,<1", "onnxruntime>=1.20,<2"]
 mlflow = ["mlflow>=2.20,<4", "python-dotenv>=1,<2"]
 wandb = ["wandb>=0.19,<1"]

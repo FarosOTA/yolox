@@ -306,7 +306,15 @@ def main():
     parser.add_argument("config", help="Per-run TOML config (never include a PAT)")
     args = parser.parse_args()
     try:
-        return run_training(load_config(args.config))
+        config = load_config(args.config)
+        env_file = Path(args.config).resolve().parent / ".env"
+        if env_file.is_file() and not os.environ.get("CVAT_ACCESS_TOKEN"):
+            from dotenv import dotenv_values
+
+            token = dotenv_values(env_file, interpolate=False).get("CVAT_ACCESS_TOKEN")
+            if token:
+                os.environ["CVAT_ACCESS_TOKEN"] = token
+        return run_training(config)
     except TrainingInterrupted as error:
         return error.exit_code
     except KeyboardInterrupt:

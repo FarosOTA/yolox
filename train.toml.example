@@ -1,6 +1,6 @@
 # Run: uv run --no-sync python tools/train_cvat.py train.toml
 # Paths are relative to this file; output defaults to datasets/cvat-runs/.
-# Supply the PAT via CVAT_ACCESS_TOKEN or the hidden prompt, never this file.
+# Store CVAT_ACCESS_TOKEN in .env beside this file, never in this TOML.
 
 [cvat]
 host = "https://cvat.example.com"

@@ -124,8 +124,23 @@ exclusion list and merge groups.
 
 ## Credentials and temporary export
 
-Provide `CVAT_ACCESS_TOKEN` through a secure environment, or enter the PAT at
-the hidden prompt. For a Bash session, with tracing disabled:
+For the TOML supervisor, store `CVAT_ACCESS_TOKEN` in `.env` beside the TOML
+file (not relative to the current working directory):
+
+```dotenv
+CVAT_ACCESS_TOKEN=your-personal-access-token
+```
+
+Edit the file locally rather than placing your token in shell commands or chat.
+The repository ignores `.env`; restrict its permissions with `chmod 600 .env`.
+For configs outside this repository, ensure their `.env` is also excluded from
+version control. Only `CVAT_ACCESS_TOKEN` is loaded; other keys are not imported,
+and `${...}` interpolation is disabled so tokens are read literally.
+An existing non-empty exported token takes precedence over `.env`. Missing or
+empty tokens fall back to the hidden prompt. The standalone preparation tool
+uses the environment or prompt, not automatic `.env` loading.
+
+Alternatively, for a Bash session with tracing disabled:
 
 ```sh
 set +x
@@ -136,7 +151,9 @@ unset CVAT_ACCESS_TOKEN
 ```
 
 There is no token CLI argument or config field. Never put the PAT in URLs,
-scripts, files, logs or shell history. A terminal without secure no-echo input
+scripts, tracked files, logs or shell history. The supervisor omits the token
+from run records and the training subprocess environment.
+A terminal without secure no-echo input
 fails rather than falling back to echoed input. SDK failures show the HTTP
 status and its standard description when available; response bodies, headers
 and raw exception strings remain suppressed because they may echo credentials.

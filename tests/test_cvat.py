@@ -785,12 +785,23 @@ def test_full_decode_is_opt_in(lan, synthetic):
         cvat.validate_coco(synthetic, lan.root, full_decode=True)
 
 
-def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_config):
+@pytest.mark.parametrize("credential_source", ["environment", "dotenv"])
+def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_config,
+                                         tmp_path, capsys, credential_source):
     import os
     from tools import train_cvat
 
     install_export(monkeypatch, synthetic)
-    run_config["nfs"]["frame_root"] = str(lan.root)
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(f'[cvat]\nhost = "{HOST}"\nproject_id = 42\n'
+                           f'[nfs]\nserver = "192.0.2.10"\nframe_root = "{lan.root}"\n'
+                           '[dataset]\noutput_dir = "runs"\n', encoding="utf-8")
+    if credential_source == "dotenv":
+        monkeypatch.delenv("CVAT_ACCESS_TOKEN")
+    file_token = "test-pat-not-a-real-secret" if credential_source == "dotenv" else "wrong-file-token"
+    (tmp_path / ".env").write_text(f'CVAT_ACCESS_TOKEN="{file_token}"\nCVAT_TEST_UNUSED=unused\n', encoding="utf-8")
+    monkeypatch.delenv("CVAT_TEST_UNUSED", raising=False)
+    monkeypatch.setattr(sys, "argv", ["train_cvat.py", str(config_path)])
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     monkeypatch.setattr(train_cvat.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(prctl=lambda *a: 0))
     monkeypatch.setattr(train_cvat, "stop_workers", lambda process: True)
@@ -806,6 +817,7 @@ def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_confi
 
     def launch(command, **kwargs):
         assert "CVAT_ACCESS_TOKEN" not in kwargs["env"]
+        assert "CVAT_TEST_UNUSED" not in kwargs["env"]
         with monkeypatch.context() as child:
             child.setenv("YOLOX_CVAT_VALIDATION", kwargs["env"]["YOLOX_CVAT_VALIDATION"])
             cvat.configure_training(get_exp(exp_name="yolox-nano"), command[4])
@@ -814,8 +826,11 @@ def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_confi
         return SimpleNamespace(wait=lambda: 0)
 
     monkeypatch.setattr(subprocess, "Popen", launch)
-    assert train_cvat.run_training(run_config) == 0
+    assert train_cvat.main() == 0
     assert sorted(opened) == sorted(image["file_name"] for image in synthetic["images"])
+    assert "test-pat-not-a-real-secret" not in str(capsys.readouterr())
+    assert not any("test-pat-not-a-real-secret" in path.read_text()
+                   for path in Path(run_config["dataset"]["output_dir"]).rglob("*.json"))
 
 
 @pytest.mark.parametrize("change", ["json", "mount", "token"])

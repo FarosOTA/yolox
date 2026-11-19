@@ -169,8 +169,10 @@ root-level config defaults to output under `datasets/cvat-runs` and uses
 The template keeps project/source, model and epoch choices explicit, with optional
 checkpoint and class-merge examples commented out. Batch size defaults to 8;
 routine defaults and advanced overrides are documented in
-the [CVAT/LAN guide](docs/cvat_training_data.md). Supply the PAT only through
-`CVAT_ACCESS_TOKEN` or the hidden prompt, never the config or CLI arguments.
+the [CVAT/LAN guide](docs/cvat_training_data.md). Store the PAT as
+`CVAT_ACCESS_TOKEN` in a gitignored `.env` beside the TOML; the supervisor loads
+only that key, without variable interpolation. An exported token takes precedence;
+the hidden prompt remains a fallback. Never put the PAT in the TOML or CLI arguments.
 
 Each invocation starts a **new run**, optionally fine-tuning from
 `training.checkpoint`; omitting it trains from scratch, with no automatic
