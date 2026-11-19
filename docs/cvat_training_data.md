@@ -65,7 +65,8 @@ such as `datasets/cvat-runs` and `weights/yolox_nano.pth`, without `../../`.
 | `dataset` | Local `output_dir` base (default `datasets/cvat-runs`), `val_fraction` (default 0.2), integer `seed` (default 0), `validation_workers` (16, allowed 1–128), `full_decode` (false). Each invocation creates a unique UTC timestamp/UUID run folder. |
 | `training` | `model` (default `yolox-nano`) **or** `exp_file`, `devices` (1), `batch` (8), `fp16` (false), `cache` (`disk`, `ram` or `none`), optional `checkpoint` for fine-tuning. There is no `resume` setting. |
 | `training.overrides` | Experiment settings such as `max_epoch = 100`, `input_size = [640, 640]` and `data_num_workers = 4`. The example selects 100 epochs; omitting this override keeps the selected experiment's default (300 for Nano). Dataset paths, class count and output directory are managed by the workflow, not overridable here. |
-| `classes.merge` | Optional target-class groups as described below. No class dropping. |
+| `classes.exclude` | Optional array of original CVAT labels to remove (default empty). Images remain, but their excluded boxes become unlabelled/background. |
+| `classes.merge` | Optional target-class groups as described below. Exclusions cannot overlap group sources or targets. |
 
 Model checkpoints/logs go under `<run>/training`. Disk caches stay in the
 local run folder, not on NFS. Every supervisor invocation starts a new run:
@@ -78,14 +79,25 @@ Use experiments honoring `data_dir`, `train_ann`, `val_ann` and `num_classes`.
 
 ### Class merging and deterministic indices
 
-Any number of target groups is supported:
+Exclusions and any number of target groups can be combined:
 
 ```toml
+[classes]
+exclude = ["cone"]
+
 [classes.merge]
 vehicle = ["car", "truck", "bus"]
 two_wheeler = ["bicycle", "motorcycle"]
 ```
 
+Exclusions refer to **original CVAT labels**, not post-merge names. Their
+categories and boxes are removed before splitting. All images remain, including
+images with no retained boxes. Excluded objects become unlabelled/background;
+this is **not** an ignore-region mechanism. No source images or CVAT annotations
+are modified on the server. Omit `classes.exclude` to preserve all classes.
+
+Unknown or duplicate exclusions, empty/non-string label names, overlap with any
+merge source or target, and exclusions leaving no classes fail explicitly.
 Unlisted labels retain their names. Unknown source labels, empty groups and
 sources appearing in multiple groups fail with explicit errors. An existing
 CVAT label cannot be a target unless explicitly listed in its own group:
@@ -96,15 +108,19 @@ Class order follows the **first occurrence of each final class while walking
 original categories in ascending CVAT category-id order**. It does not depend
 on TOML group order or source-array order. For source ids `car=1`, `person=3`,
 `truck=4`, `bicycle=7`, `motorcycle=9`, `cone=11`, `bus=12`, the above groups
-produce `["vehicle", "person", "two_wheeler", "cone"]` at indices 0–3.
-An untouched label's index can shift when preceding labels merge.
+produce `["vehicle", "person", "two_wheeler"]` at indices 0–2 with `cone`
+excluded. An untouched label's index can shift when preceding labels merge
+or are excluded.
 
-With merging enabled, categories are renumbered 1–N and every annotation's
-`category_id` is rewritten in **both** train and validation JSON. Without
-merges, sorted original category ids are retained. `classes.json`, reported
+With merging or exclusions enabled, surviving categories are renumbered 1–N
+and every retained annotation's `category_id` is rewritten in **both** train
+and validation JSON. Without either, sorted original category ids are retained.
+`classes.json`, reported
 `num_classes`, loaders and per-class AP all use the final names/indices.
-Every original box is retained; this feature does not turn excluded objects
-into background. The final source-to-class mapping is printed and saved.
+Every box of retained labels is preserved. The final source-to-class mapping
+is printed and saved; excluded source labels have `null` for `class`,
+`category_id` and `class_index`. `resolved_config.json` also records the exact
+exclusion list and merge groups.
 
 ## Credentials and temporary export
 
@@ -286,8 +302,8 @@ resolutions, or set `training.cache = "none"` when capacity is insufficient.
 ## Standalone preparation and rechecks
 
 The lower-level existing-mount tool requires a new local output directory;
-the supervisor above creates it automatically. This tool does not merge
-classes; use the TOML supervisor for per-run merging.
+the supervisor above creates it automatically. This tool does not select or merge
+classes; use the TOML supervisor for per-run exclusions and merging.
 
 ```sh
 uv run --no-sync python tools/prepare_cvat.py prepare \
@@ -324,7 +340,8 @@ use an existing mount/prepared directory whose image links remain valid.
 Tests use fake networking/mounts and a synthetic multi-subset COCO export,
 real decoded images, YOLOX train/validation loaders, local disk caching and
 COCO evaluation. They cover gateway/Tailscale/hairpin rejection, link warnings,
-image failures, permissions, config typos/paths, grouped merging/order/AP
+image failures, permissions, config typos/paths, exclusions (including empty
+images), grouped merging/order/AP
 names, unique runs/records, and lifecycle cleanup including signals, partial
 mount failure, stuck workers and failed unmount. A repository privacy test
 scans tracked and non-ignored new files. SDK tests need the `cvat` extra;

@@ -36,7 +36,7 @@ def load_config(path):
         "training": {"model": (str,), "exp_file": (str,), "devices": (int,), "batch": (int,),
                      "fp16": (bool,), "cache": (str,), "checkpoint": (str,),
                      "overrides": (dict,)},
-        "classes": {"merge": (dict,)},
+        "classes": {"merge": (dict,), "exclude": (list,)},
     }
     defaults = {
         "cvat": {},
@@ -45,7 +45,7 @@ def load_config(path):
                     "validation_workers": 16, "full_decode": False},
         "training": {"devices": 1, "batch": 8, "fp16": False, "cache": "disk",
                      "overrides": {}},
-        "classes": {"merge": {}},
+        "classes": {"merge": {}, "exclude": []},
     }
     unknown = set(supplied) - set(schema)
     if unknown:
@@ -100,7 +100,7 @@ def load_config(path):
                        (training, "exp_file"), (training, "checkpoint")):
         if key in table:
             table[key] = str((path.parent / Path(table[key]).expanduser()).resolve())
-    class_merge_sources(config["classes"]["merge"])
+    class_merge_sources(config["classes"]["merge"], config["classes"]["exclude"])
     exp = get_exp(training.get("exp_file"), training.get("model"))
     for key, value in training["overrides"].items():
         if key not in vars(exp):
@@ -253,6 +253,7 @@ def run_training(config):
                     raise TrainingInterrupted(pending[0])
         prepare_dataset(cvat["host"], cvat["project_id"], root, output,
                         dataset["val_fraction"], dataset["seed"], merge=config["classes"]["merge"],
+                        exclude=config["classes"]["exclude"],
                         nfs_server=nfs["server"], nfs_export=nfs["export"], data=data,
                         workers=dataset["validation_workers"], full_decode=dataset["full_decode"],
                         validation_token=validation_token)

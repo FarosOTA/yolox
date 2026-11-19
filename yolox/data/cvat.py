@@ -360,7 +360,7 @@ def export_project(host, project_id, destination):
         token = None
 
 
-def class_merge_sources(groups):
+def class_merge_sources(groups, exclude=()):
     """Validate target-grouped config and expand it without depending on TOML key order."""
     sources = {}
     for target, labels in groups.items():
@@ -373,12 +373,20 @@ def class_merge_sources(groups):
                 raise ValueError(f"CVAT label {label!r} appears in both merge groups "
                                  f"{sources[label]!r} and {target!r}")
             sources[label] = target
+    if (not isinstance(exclude, (list, tuple))
+            or any(not isinstance(label, str) or not label.strip() for label in exclude)
+            or len(set(exclude)) != len(exclude)):
+        raise ValueError("classes.exclude must be an array of unique non-empty source label names")
+    overlap = set(exclude) & (set(sources) | set(groups))
+    if overlap:
+        raise ValueError("classes.exclude overlaps merge sources or targets: "
+                         + ", ".join(sorted(overlap)))
     return sources
 
 
-def merge_classes(data, merge):
+def merge_classes(data, merge, exclude=()):
     """First occurrence in ascending source-id order owns each final class."""
-    sources = class_merge_sources(merge)
+    sources = class_merge_sources(merge, exclude)
     categories = sorted(data["categories"], key=lambda category: category["id"])
     names = [category["name"] for category in categories]
     if len(set(names)) != len(names):
@@ -386,21 +394,32 @@ def merge_classes(data, merge):
     unknown = set(sources) - set(names)
     if unknown:
         raise ValueError(f"Unknown CVAT labels in classes.merge: {', '.join(sorted(unknown))}")
+    unknown = set(exclude) - set(names)
+    if unknown:
+        raise ValueError(f"Unknown CVAT labels in classes.exclude: {', '.join(sorted(unknown))}")
     for target, labels in merge.items():
         if target in names and target not in labels:
             raise ValueError(f"Merge target {target!r} is an existing CVAT label; "
                              "include it explicitly in its own group to merge it")
     classes, remap, mapping = {}, {}, []
     for category in categories:
+        if category["name"] in exclude:
+            mapping.append({"source_id": category["id"], "source": category["name"],
+                            "class": None, "category_id": None, "class_index": None})
+            continue
         name = sources.get(category["name"], category["name"])
         if name not in classes:
             classes[name] = len(classes) + 1
-        target_id = classes[name] if merge else category["id"]
+        target_id = classes[name] if merge or exclude else category["id"]
         remap[category["id"]] = target_id
         mapping.append({"source_id": category["id"], "source": category["name"],
                         "class": name, "category_id": target_id, "class_index": classes[name] - 1})
-    if merge:
+    if not classes:
+        raise ValueError("classes.exclude must leave at least one class")
+    if merge or exclude:
         data["categories"] = [{"id": id_, "name": name} for name, id_ in classes.items()]
+        data["annotations"] = [annotation for annotation in data["annotations"]
+                               if annotation["category_id"] in remap]
         for annotation in data["annotations"]:
             annotation["category_id"] = remap[annotation["category_id"]]
     else:
@@ -410,7 +429,7 @@ def merge_classes(data, merge):
 
 
 def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2, seed=0,
-                    *, nfs_server, merge=None, nfs_export="/", data=None,
+                    *, nfs_server, merge=None, exclude=(), nfs_export="/", data=None,
                     workers=16, full_decode=False, validation_token=None):
     cvat_hostname(cvat_host)
     if not 0 < val_fraction < 1:
@@ -426,7 +445,7 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2,
             export_project(cvat_host, project_id, archive)
             data = read_export(archive)
     validate_coco(data, root, workers=workers, full_decode=full_decode)
-    mapping = merge_classes(data, merge or {})
+    mapping = merge_classes(data, merge or {}, exclude)
     val_rides, train_rides = validation_rides(data, val_fraction, seed)
     output.mkdir(parents=True)
     (output / "annotations").mkdir()

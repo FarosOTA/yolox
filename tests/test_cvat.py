@@ -512,6 +512,12 @@ def test_supervisor_never_unmounts_existing_root(lan, synthetic, monkeypatch, ru
     ('[classes.merge]\nvehicle = []', "non-empty array"),
     ('[classes.merge]\nvehicle = "car"', "non-empty array"),
     ('[classes.merge]\nvehicle = ["car"]\nother = ["car"]', "'car'.*'vehicle'.*'other'"),
+    ('[classes]\nexclude = "car"', "Invalid value type.*classes.exclude"),
+    ('[classes]\nexclude = [2]', "unique non-empty source label names"),
+    ('[classes]\nexclude = ["car", "car"]', "unique non-empty source label names"),
+    ('[classes]\nexclude = [" "]', "unique non-empty source label names"),
+    ('[classes]\nexclude = ["car"]\n[classes.merge]\nvehicle = ["car"]', "overlaps merge sources or targets: car"),
+    ('[classes]\nexclude = ["vehicle"]\n[classes.merge]\nvehicle = ["car"]', "overlaps merge sources or targets: vehicle"),
 ])
 def test_config_rejects_typos_and_invalid_settings(tmp_path, extra, message):
     from tools.train_cvat import load_config
@@ -559,12 +565,14 @@ def test_config_paths_and_training_settings(tmp_path):
                     'frame_root = "../mounted"\n[dataset]\noutput_dir = "../runs"\n'
                     '[training]\nmodel = "yolox-s"\ndevices = 2\nbatch = 6\n'
                     'fp16 = true\ncache = "ram"\ncheckpoint = "../previous.pth"\n'
-                    '[training.overrides]\nmax_epoch = 7\ninput_size = [96, 64]\n', encoding="utf-8")
+                    '[training.overrides]\nmax_epoch = 7\ninput_size = [96, 64]\n'
+                    '[classes]\nexclude = ["cone"]\n', encoding="utf-8")
     config = load_config(path)
     output = tmp_path / "runs" / "new"
     parsed = make_parser().parse_args(training_arguments(config, output))
     assert config["nfs"]["frame_root"] == str(tmp_path / "mounted")
     assert config["dataset"]["output_dir"] == str(tmp_path / "runs")
+    assert config["classes"]["exclude"] == ["cone"]
     assert (parsed.name, parsed.devices, parsed.batch_size) == ("yolox-s", 2, 6)
     assert parsed.fp16 and not parsed.resume and parsed.cache == "ram"
     assert parsed.ckpt == str(tmp_path / "previous.pth")
@@ -606,8 +614,9 @@ def grouped_export(synthetic):
     return synthetic
 
 
+@pytest.mark.parametrize("exclude", [[], ["person", "cone"]])
 def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, run_config,
-                                                         monkeypatch, capsys, tmp_path):
+                                                         monkeypatch, capsys, tmp_path, exclude):
     from tools import train_cvat
     from yolox.evaluators.coco_evaluator import COCOEvaluator
     import os
@@ -617,6 +626,15 @@ def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, r
         "two_wheeler": ["motorcycle", "bicycle"],
         "vehicle": ["bus", "truck", "vehicle", "car"],
     }
+    run_config["classes"]["exclude"] = exclude
+    expected_classes = ["vehicle", "two_wheeler"] if exclude else ["vehicle", "person", "two_wheeler", "cone"]
+    expected_mapping = ([
+        ("car", 0), ("person", None), ("truck", 0), ("bicycle", 1),
+        ("motorcycle", 1), ("cone", None), ("bus", 0), ("vehicle", 0),
+    ] if exclude else [
+        ("car", 0), ("person", 1), ("truck", 0), ("bicycle", 2),
+        ("motorcycle", 2), ("cone", 3), ("bus", 0), ("vehicle", 0),
+    ])
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     monkeypatch.setattr(train_cvat.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(prctl=lambda *a: 0))
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: SimpleNamespace(wait=lambda: 0))
@@ -626,12 +644,12 @@ def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, r
     runs = sorted(Path(run_config["dataset"]["output_dir"]).iterdir())
     assert len(runs) == 2 and runs[0] != runs[1]
     for output in runs:
-        assert json.loads((output / "classes.json").read_text()) == ["vehicle", "person", "two_wheeler", "cone"]
+        assert json.loads((output / "classes.json").read_text()) == expected_classes
         mapping = json.loads((output / "class_mapping.json").read_text())
-        assert [(entry["source"], entry["class_index"]) for entry in mapping] == [
-            ("car", 0), ("person", 1), ("truck", 0), ("bicycle", 2),
-            ("motorcycle", 2), ("cone", 3), ("bus", 0), ("vehicle", 0),
-        ]
+        assert [(entry["source"], entry["class_index"]) for entry in mapping] == expected_mapping
+        for entry in mapping:
+            if entry["source"] in exclude:
+                assert entry["class"] is None and entry["category_id"] is None
         resolved = json.loads((output / "resolved_config.json").read_text())
         assert resolved["classes"] == run_config["classes"]
         assert resolved["run"]["directory"] == str(output)
@@ -640,14 +658,14 @@ def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, r
     exp = get_exp(exp_name="yolox-nano")
     exp.input_size = exp.test_size = (32, 32)
     cvat.configure_training(exp, runs[0])
-    assert exp.num_classes == 4
+    assert exp.num_classes == len(expected_classes)
     train, val = exp.get_dataset(), exp.get_eval_dataset()
-    assert train._classes == val._classes == ("vehicle", "person", "two_wheeler", "cone")
+    assert train._classes == val._classes == tuple(expected_classes)
     for dataset in (train, val):
-        assert dataset.class_ids == [1, 2, 3, 4]
-        assert dataset.pull_item(0)[1][:, 4].tolist() == [0, 1, 0, 2, 2, 3, 0, 0]
-        assert len(dataset.coco.dataset["annotations"]) == len(dataset) * 8  # No boxes dropped.
-    evaluator = COCOEvaluator(SimpleNamespace(dataset=val, batch_size=1), (32, 32), 0.01, 0.65, 4)
+        assert dataset.class_ids == ([1, 2] if exclude else [1, 2, 3, 4])
+        assert dataset.pull_item(0)[1][:, 4].tolist() == ([0, 0, 1, 1, 0, 0] if exclude else [0, 1, 0, 2, 2, 3, 0, 0])
+        assert len(dataset.coco.dataset["annotations"]) == len(dataset) * (6 if exclude else 8)
+    evaluator = COCOEvaluator(SimpleNamespace(dataset=val, batch_size=1), (32, 32), 0.01, 0.65, len(expected_classes))
     # Scope the evaluator's temporary predictions to this test's filesystem.
     monkeypatch.setattr("yolox.evaluators.coco_evaluator.tempfile.mkstemp",
                         lambda: (0, str(tmp_path / "predictions.json")))
@@ -655,26 +673,49 @@ def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, r
                     "bbox": a["bbox"], "score": 1.0} for a in val.coco.dataset["annotations"]]
     ap, _, report = evaluator.evaluate_prediction(predictions, np.array([0.1, 0.1, 1]))
     assert ap == pytest.approx(1.0)
-    for name in ("vehicle", "person", "two_wheeler", "cone"):
+    for name in expected_classes:
         assert name in report
-    for name in ("car", "truck", "bus", "bicycle", "motorcycle"):
+    for name in ["car", "truck", "bus", "bicycle", "motorcycle", *exclude]:
         assert f"| {name} " not in report
     assert "Final source-to-class mapping" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("merge,message", [
-    ({"vehicle": ["car", "typo"]}, "Unknown CVAT labels.*typo"),
-    ({"vehicle": ["car"], "other": ["car"]}, "'car'.*'vehicle'.*'other'"),
-    ({"vehicle": []}, "non-empty array"),
-    ({"vehicle": ["car"]}, "'vehicle'.*existing CVAT label"),
+@pytest.mark.parametrize("merge,exclude,message", [
+    ({"vehicle": ["car", "typo"]}, [], "Unknown CVAT labels.*typo"),
+    ({"vehicle": ["car"], "other": ["car"]}, [], "'car'.*'vehicle'.*'other'"),
+    ({"vehicle": []}, [], "non-empty array"),
+    ({"vehicle": ["car"]}, [], "'vehicle'.*existing CVAT label"),
+    ({}, ["typo"], "Unknown CVAT labels in classes.exclude: typo"),
+    ({}, ["car", "person", "truck", "bicycle", "motorcycle", "cone", "bus", "vehicle"], "leave at least one class"),
 ])
 def test_invalid_class_groups_fail_before_prepared_output(lan, grouped_export, tmp_path,
-                                                         monkeypatch, merge, message):
+                                                         monkeypatch, merge, exclude, message):
     install_export(monkeypatch, grouped_export)
     output = tmp_path / "invalid"
     with pytest.raises(ValueError, match=message):
-        cvat.prepare_dataset(HOST, 42, lan.root, output, merge=merge, nfs_server="192.0.2.10")
+        cvat.prepare_dataset(HOST, 42, lan.root, output, merge=merge, exclude=exclude, nfs_server="192.0.2.10")
     assert not output.exists()
+
+
+def test_exclusion_without_merges_keeps_empty_images(lan, synthetic, tmp_path, monkeypatch):
+    synthetic["annotations"][0]["category_id"] = 2  # Only the first image retains a box.
+    install_export(monkeypatch, synthetic)
+    output = tmp_path / "excluded"
+    cvat.prepare_dataset(HOST, 42, lan.root, output, exclude=["car"], nfs_server="192.0.2.10")
+    exp = get_exp(exp_name="yolox-nano")
+    cvat.configure_training(exp, output)
+    assert exp.num_classes == 1
+    datasets = [exp.get_dataset(), exp.get_eval_dataset()]
+    assert sum(len(dataset) for dataset in datasets) == 4
+    assert sum(len(dataset.coco.dataset["annotations"]) for dataset in datasets) == 1
+    for dataset in datasets:
+        assert dataset._classes == ("person",) and dataset.class_ids == [1]
+        for index in range(len(dataset)):
+            labels = dataset.load_anno(index)
+            assert labels.shape[1] == 5
+            assert labels[:, 4].tolist() in ([], [0])
+    assert sum(len(dataset.load_anno(index)) == 0
+               for dataset in datasets for index in range(len(dataset))) == 3
 
 
 def test_header_validation_does_not_decode_pixels(lan, synthetic, monkeypatch):

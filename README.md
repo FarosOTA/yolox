@@ -185,8 +185,12 @@ completion, failure or interruption; cleanup failures retain the mount and
 print recovery commands. `nfs.frame_root` instead reuses an existing mount
 without managing it; skip `sudo -v` in that mode. Never run training as root.
 Run records, cache and checkpoints stay in unique local run folders. Optional
-`[classes.merge]` groups preserve all annotations and write the final mapping
-for both splits and evaluation. `tools/prepare_cvat.py` offers standalone
+`[classes] exclude = ["cone"]` removes original CVAT labels and their boxes
+from both splits while retaining all images: excluded objects become background,
+not ignore regions. Optional `[classes.merge]` groups combine retained labels;
+exclusions cannot overlap merge sources or targets. The saved mapping records
+excluded labels and final class indices for loaders and evaluation.
+`tools/prepare_cvat.py` offers standalone
 preparation and preflight checks. Networking/mounts are fixture-tested; a live
 CVAT/NFS connection and CUDA training are not established by those tests.
 

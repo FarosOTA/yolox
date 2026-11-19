@@ -16,6 +16,10 @@ model = "yolox-nano"
 # Optional COCO-pretrained weights; omit to train from scratch.
 # checkpoint = "weights/yolox_nano.pth"
 
+# Optional: exclude original labels; their boxes become unlabelled/background.
+# [classes]
+# exclude = ["cone"]
+
 # Optional: target class = source labels.
 # [classes.merge]
 # vehicle = ["car", "truck", "bus"]
