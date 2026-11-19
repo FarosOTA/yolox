@@ -153,7 +153,7 @@ uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 --resume -c path/
 
 ## CVAT and LAN training data
 
-This fork adds `tools/train_cvat.py` for Linux: export a CVAT project's
+This fork adds `tools/train_cvat.py` for Linux: export selected CVAT tasks'
 **COCO 1.0 annotations without images**, read listed frames over read-only
 NFSv4, split by ride and supervise normal-user training. Install the optional
 SDK and copy the [minimal run template](train.toml.example):
@@ -161,7 +161,7 @@ SDK and copy the [minimal run template](train.toml.example):
 ```sh
 uv sync --locked --extra cuda --extra export --extra cvat
 cp train.toml.example train.toml
-# Edit the CVAT host/project and NFS server in train.toml first.
+# Edit the CVAT host/task IDs and NFS server in train.toml first.
 sudo -v
 uv run --no-sync python tools/train_cvat.py train.toml
 ```
@@ -169,7 +169,11 @@ uv run --no-sync python tools/train_cvat.py train.toml
 `train.toml` is gitignored. Paths resolve relative to the TOML file, so a
 root-level config defaults to output under `datasets/cvat-runs` and uses
 `weights/yolox_nano.pth` without `../../` for optional pretrained weights.
-The template keeps project/source, model and epoch choices explicit, with optional
+The template uses fixture task IDs: replace them with your actual `cvat.task_ids`.
+Only those tasks are exported; their frames are split by ride into training and
+validation (no separate test split). Legacy `cvat.project_id` configs still work,
+but cannot be combined with `task_ids`.
+The template keeps task/source and model choices explicit, with optional
 checkpoint and class-merge examples commented out. Batch size defaults to 8;
 routine defaults and advanced overrides are documented in
 the [CVAT/LAN guide](docs/cvat_training_data.md). Store the PAT as

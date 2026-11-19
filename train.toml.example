@@ -4,7 +4,9 @@
 
 [cvat]
 host = "https://cvat.example.com"
-project_id = 42
+# Fixture IDs only: replace with your actual CVAT task IDs.
+# Selected frames are split by ride into training and validation, not by task count.
+task_ids = [101, 102, 103, 104]
 
 [nfs]
 server = "192.0.2.10"

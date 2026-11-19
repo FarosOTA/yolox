@@ -31,7 +31,7 @@ def load_config(path):
     with path.open("rb") as stream:
         supplied = tomllib.load(stream)
     schema = {
-        "cvat": {"host": (str,), "project_id": (int,)},
+        "cvat": {"host": (str,), "project_id": (int,), "task_ids": (list,)},
         "nfs": {"server": (str,), "export": (str,), "options": (list,), "frame_root": (str,)},
         "dataset": {"output_dir": (str,), "val_fraction": (int, float), "seed": (int,),
                     "validation_workers": (int,), "full_decode": (bool,)},
@@ -66,8 +66,17 @@ def load_config(path):
         defaults[table].update(values)
     config = defaults
     cvat, nfs, dataset, training = (config[key] for key in ("cvat", "nfs", "dataset", "training"))
-    if "host" not in cvat or "project_id" not in cvat or cvat["project_id"] < 1:
-        raise ValueError("cvat.host and a positive cvat.project_id are required")
+    if "host" not in cvat or not ({"project_id", "task_ids"} & cvat.keys()):
+        raise ValueError("cvat.host and cvat.task_ids (or cvat.project_id) are required")
+    if "project_id" in cvat and "task_ids" in cvat:
+        raise ValueError("Choose cvat.task_ids or cvat.project_id, not both")
+    if "project_id" in cvat and cvat["project_id"] < 1:
+        raise ValueError("cvat.project_id must be positive")
+    if "task_ids" in cvat:
+        ids = cvat["task_ids"]
+        if (not ids or any(type(task) is not int or task < 1 for task in ids)
+                or len(set(ids)) != len(ids)):
+            raise ValueError("cvat.task_ids must be a non-empty list of unique positive integers")
     cvat_hostname(cvat["host"])
     if "server" not in nfs:
         raise ValueError("nfs.server is required; there is no built-in server address")
@@ -223,12 +232,21 @@ def run_training(config):
         check_network_hosts(cvat["host"], nfs["server"])
         # Export only annotations before mounting: capacity must fail without touching NFS images.
         with tempfile.TemporaryDirectory(prefix="yolox-cvat-") as temporary:
-            archive = Path(temporary) / "annotations.zip"
             report.start_phase("CVAT export and download")
-            export_project(cvat["host"], cvat["project_id"], archive)
+            archives = []
+            if "task_ids" in cvat:
+                for index, task_id in enumerate(cvat["task_ids"], 1):
+                    print(f"Exporting selected task {index}/{len(cvat['task_ids'])}: {task_id}", flush=True)
+                    archive = Path(temporary) / f"task-{task_id}.zip"
+                    export_project(cvat["host"], None, archive, task_id=task_id)
+                    archives.append(archive)
+            else:
+                archive = Path(temporary) / "annotations.zip"
+                export_project(cvat["host"], cvat["project_id"], archive)
+                archives.append(archive)
             report.start_phase("Reading annotations")
             print("Reading exported annotations...", flush=True)
-            data = read_export(archive)
+            data = read_export(archives)
             counts = Counter(annotation["category_id"] for annotation in data["annotations"])
             report.data["source"] = {
                 "frames": len(data["images"]), "boxes": len(data["annotations"]),
@@ -281,12 +299,13 @@ def run_training(config):
                 if pending:
                     raise TrainingInterrupted(pending[0])
         print("Preparing dataset: checking mount, validating images and mapping classes...", flush=True)
-        prepare_dataset(cvat["host"], cvat["project_id"], root, output,
+        prepare_dataset(cvat["host"], cvat.get("project_id"), root, output,
                         dataset["val_fraction"], dataset["seed"], merge=config["classes"]["merge"],
                         exclude=config["classes"]["exclude"],
                         nfs_server=nfs["server"], nfs_export=nfs["export"], data=data,
                         workers=dataset["validation_workers"], full_decode=dataset["full_decode"],
-                        validation_token=validation_token, report=report)
+                        validation_token=validation_token, report=report,
+                        task_ids=cvat.get("task_ids"))
         report.start_phase("Writing run configuration")
         training_args = training_arguments(config, output)
         resolved = {**config, "run": {"directory": str(output), "frame_root": str(root),

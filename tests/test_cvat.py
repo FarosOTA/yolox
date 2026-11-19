@@ -246,7 +246,7 @@ def test_permission_error_names_export_identity(lan, synthetic, monkeypatch):
         cvat.validate_coco(synthetic, lan.root)
 
 
-def install_export(monkeypatch, data):
+def install_export(monkeypatch, data, *, tasks=None):
     cvat_sdk = pytest.importorskip("cvat_sdk")
     from cvat_sdk.core.proxies.types import Location
 
@@ -254,6 +254,8 @@ def install_export(monkeypatch, data):
         assert host == HOST and access_token == "test-pat-not-a-real-secret"
 
         class Client:
+            selected = data
+
             def __enter__(self):
                 return self
 
@@ -262,10 +264,19 @@ def install_export(monkeypatch, data):
 
             @property
             def projects(self):
+                assert tasks is None, "Task selection must never export the entire project"
+                return self
+
+            @property
+            def tasks(self):
+                assert tasks is not None
                 return self
 
             def retrieve(self, project_id):
-                assert project_id == 42
+                if tasks is None:
+                    assert project_id == 42
+                else:
+                    self.selected = tasks[project_id]
                 return self
 
             def export_dataset(self, format_name, destination, *, include_images, location, pbar):
@@ -274,6 +285,7 @@ def install_export(monkeypatch, data):
                 assert destination.parent.is_dir()
                 with zipfile.ZipFile(destination, "w") as bundle:
                     # Independent id spaces from two CVAT subsets.
+                    data = self.selected
                     for index, images in enumerate((data["images"][:2], data["images"][2:])):
                         ids = {image["id"] for image in images}
                         subset = {**data, "images": copy.deepcopy(images), "annotations": [
@@ -568,6 +580,19 @@ def test_config_requires_deployment_settings(tmp_path, missing):
         load_config(path)
 
 
+@pytest.mark.parametrize("selection", [
+    "task_ids = []", "task_ids = [0]", "task_ids = [true]", "task_ids = [101, 101]",
+    'task_ids = ["101"]', "task_ids = [[101]]", "task_ids = [101]\nproject_id = 42",
+])
+def test_config_rejects_invalid_task_selection(tmp_path, selection):
+    from tools.train_cvat import load_config
+    path = tmp_path / "tasks.toml"
+    path.write_text(f'[cvat]\nhost = "{HOST}"\n{selection}\n'
+                    '[nfs]\nserver = "192.0.2.10"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="cvat.task_ids"):
+        load_config(path)
+
+
 def test_config_paths_and_training_settings(tmp_path):
     from tools.train_cvat import load_config, training_arguments
     from tools.train import make_parser
@@ -800,15 +825,25 @@ def test_full_decode_is_opt_in(lan, synthetic):
 
 
 @pytest.mark.parametrize("credential_source", ["environment", "dotenv"])
+@pytest.mark.parametrize("selection", ["project", "tasks"])
 def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_config,
-                                         tmp_path, capsys, credential_source):
+                                         tmp_path, capsys, credential_source, selection):
     import os
     from tools import train_cvat
 
     synthetic["annotations"][-1]["category_id"] = 2
-    install_export(monkeypatch, synthetic)
+    tasks = None
+    if selection == "tasks":
+        tasks = {}
+        for task_id, images in ((101, synthetic["images"][:2]), (103, synthetic["images"][2:])):
+            ids = {image["id"] for image in images}
+            tasks[task_id] = {**synthetic, "images": images, "annotations": [
+                annotation for annotation in synthetic["annotations"] if annotation["image_id"] in ids
+            ]}
+    install_export(monkeypatch, synthetic, tasks=tasks)
     config_path = tmp_path / "run.toml"
-    config_path.write_text(f'[cvat]\nhost = "{HOST}"\nproject_id = 42\n'
+    source = "project_id = 42" if selection == "project" else "task_ids = [101, 103]"
+    config_path.write_text(f'[cvat]\nhost = "{HOST}"\n{source}\n'
                            f'[nfs]\nserver = "192.0.2.10"\nframe_root = "{lan.root}"\n'
                            '[dataset]\noutput_dir = "runs"\n[classes]\nexclude = ["person"]\n', encoding="utf-8")
     if credential_source == "dotenv":
@@ -851,6 +886,10 @@ def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_confi
     assert "Downloading: 100%" in captured.err
     assert "Validating images: 100%" in captured.err and "4/4" in captured.err
     summary_path, = Path(run_config["dataset"]["output_dir"]).glob("*/summary.json")
+    manifest = json.loads((summary_path.parent / "prepared.json").read_text())
+    if selection == "tasks":
+        assert manifest["task_ids"] == [101, 103] and "project_id" not in manifest
+        assert summary_path.parent.joinpath("resolved_config.json").is_file()
     summary = json.loads(summary_path.read_text())
     assert summary["status"] == "completed" and summary["trainer_exit_code"] == 0
     assert summary["source"]["frames"] == 4 and summary["source"]["boxes"] == 4

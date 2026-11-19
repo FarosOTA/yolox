@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from urllib.parse import urlsplit
 import warnings
 import zipfile
@@ -402,15 +403,20 @@ def check_cache_space(data, output, input_size, test_size, val_fraction=0.2, see
 
 
 def read_export(archive):
-    """Combine CVAT COCO subsets with independent id spaces without extracting the zip."""
+    """Combine CVAT COCO archives/subsets with independent id spaces without extraction."""
     combined = {"images": [], "annotations": [], "categories": []}
-    with zipfile.ZipFile(archive) as bundle:
-        files = sorted(name for name in bundle.namelist()
-                       if name.startswith("annotations/") and name.endswith(".json"))
-        if not files:
-            raise ValueError("CVAT export has no annotations/*.json")
+    archives = archive if isinstance(archive, (list, tuple)) else [archive]
+    with ExitStack() as stack:
+        bundles = [stack.enter_context(zipfile.ZipFile(path)) for path in archives]
+        files = []
+        for bundle in bundles:
+            names = sorted(name for name in bundle.namelist()
+                           if name.startswith("annotations/") and name.endswith(".json"))
+            if not names:
+                raise ValueError("CVAT export has no annotations/*.json")
+            files.extend((bundle, name) for name in names)
         categories = None
-        for name in files:
+        for bundle, name in files:
             data = json.loads(bundle.read(name))
             current = sorted(data["categories"], key=lambda category: category["id"])
             if categories is not None and current != categories:
@@ -434,7 +440,7 @@ def read_export(archive):
     return combined
 
 
-def export_project(host, project_id, destination):
+def export_project(host, project_id, destination, *, task_id=None):
     # Import lazily: checking a prepared dataset does not need the optional SDK.
     try:
         from cvat_sdk import make_client
@@ -455,13 +461,16 @@ def export_project(host, project_id, destination):
     if not token or not token.strip():
         raise ValueError("A CVAT personal access token is required")
     started = time.monotonic()
+    resource = f"task {task_id}" if task_id is not None else f"project {project_id}"
     try:
         for attempt in range(2):
             try:
-                print(f"Exporting CVAT project {project_id} annotations (attempt {attempt + 1}); "
+                print(f"Exporting CVAT {resource} annotations (attempt {attempt + 1}); "
                       "waiting for server preparation, then downloading...", flush=True)
                 with make_client(host, access_token=token) as client:
-                    client.projects.retrieve(project_id).export_dataset(
+                    source = (client.tasks.retrieve(task_id) if task_id is not None
+                              else client.projects.retrieve(project_id))
+                    source.export_dataset(
                         "COCO 1.0", destination, include_images=False, location=Location.LOCAL,
                         pbar=DeferredTqdmProgressReporter({"mininterval": 1, "miniters": 1}),
                     )
@@ -477,7 +486,7 @@ def export_project(host, project_id, destination):
                     time.sleep(3)
                     continue
                 raise ValueError(f"CVAT export failed on attempt {attempt + 1} ({detail}); "
-                                 "check TLS, PAT permissions, project id and server. "
+                                 "check TLS, PAT permissions, project/task id and server. "
                                  "Response bodies/headers omitted to protect credentials.") from None
     finally:
         token = None
@@ -553,7 +562,8 @@ def merge_classes(data, merge, exclude=()):
 
 def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2, seed=0,
                     *, nfs_server, merge=None, exclude=(), nfs_export="/", data=None,
-                    workers=16, full_decode=False, validation_token=None, report=None):
+                    workers=16, full_decode=False, validation_token=None, report=None,
+                    task_ids=None):
     if report is not None:
         report.start_phase("Mounted source preflight")
     cvat_hostname(cvat_host)
@@ -617,6 +627,9 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2,
         "train_rides": sorted(train_rides), "val_rides": sorted(val_rides),
         "validation_workers": workers, "full_decode": full_decode,
     }
+    if task_ids is not None:
+        manifest.pop("project_id")
+        manifest["task_ids"] = task_ids
     (output / "prepared.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     if validation_token:
         (output / "validation.json").write_text(json.dumps({

@@ -60,11 +60,11 @@ such as `datasets/cvat-runs` and `weights/yolox_nano.pth`, without `../../`.
 
 | Table | Settings |
 | --- | --- |
-| `cvat` | Required HTTPS `host` and positive integer `project_id`. Keep the hostname for TLS; no credentials, path or query in the URL. |
+| `cvat` | Required HTTPS `host` and non-empty `task_ids` array of unique positive integers. The template's IDs are fixtures; replace them with your tasks. Only selected tasks are exported and combined, then split by ride into train/validation; there is no separate test split. Legacy positive integer `project_id` is an alternative, never combined with `task_ids`. Keep the hostname for TLS; no credentials, path or query in the URL. |
 | `nfs` | Required LAN IPv4 `server`; `export` defaults to `/`; `options` defaults to `["ro", "vers=4.2", "proto=tcp"]`. These three options are mandatory; only `nosuid`, `nodev`, `noexec`, `hard` may be added. Optional `frame_root` reuses an existing mount and never mounts/unmounts it. |
 | `dataset` | Local `output_dir` base (default `datasets/cvat-runs`), `val_fraction` (default 0.2), integer `seed` (default 0), `validation_workers` (16, allowed 1–128), `full_decode` (false). Each invocation creates a unique UTC timestamp/UUID run folder. |
 | `training` | `model` (default `yolox-nano`) **or** `exp_file`, `devices` (1), `batch` (8), `fp16` (false), `cache` (`disk`, `ram` or `none`), optional `checkpoint` for fine-tuning. There is no `resume` setting. |
-| `training.overrides` | Experiment settings such as `max_epoch = 100`, `input_size = [640, 640]` and `data_num_workers = 4`. The example selects 100 epochs; omitting this override keeps the selected experiment's default (300 for Nano). Dataset paths, class count and output directory are managed by the workflow, not overridable here. |
+| `training.overrides` | Experiment settings such as `max_epoch = 100`, `input_size = [640, 640]` and `data_num_workers = 4`. The example omits overrides, keeping the selected experiment's defaults (300 epochs for Nano). Dataset paths, class count and output directory are managed by the workflow, not overridable here. |
 | `classes.exclude` | Optional array of original CVAT labels to remove (default empty). Images remain, but their excluded boxes become unlabelled/background. |
 | `classes.merge` | Optional target-class groups as described below. Exclusions cannot overlap group sources or targets. |
 
@@ -327,7 +327,7 @@ Each unique run folder contains:
 - `annotations/instances_train2017.json` and `instances_val2017.json`;
 - `train2017` and `val2017` symlinks to the same frame root, with distinct JSON selections;
 - `classes.json` in model index order and `class_mapping.json` with each source id/name, target name/id/index;
-- `prepared.json` with server/project, NFS, split and class metadata;
+- `prepared.json` with server/task IDs (or legacy project ID), NFS, split and class metadata;
 - `resolved_config.json` with validated defaults, resolved paths, grouped merges and generated training arguments (no PAT or raw config comments);
 - `summary.json` after supervised cleanup, with the run outcome, phase durations, frame statistics, dataset counts and cleanup result; failures before a run directory is created print only a terminal summary;
 - transient `validation.json` for the one-use supervisor-to-launcher handoff (a random handoff identifier, **not** a CVAT PAT; consumed by the launcher);
