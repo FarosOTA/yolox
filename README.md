@@ -67,6 +67,21 @@ complete support policy, including Apple Silicon CPU and CoreML limitations.
 
 ## Training, resume and distributed evaluation
 
+Download the official COCO-pretrained Nano, Tiny, S, M, L and X checkpoints with
+the fork's downloader (requires Bash and curl):
+
+```sh
+bash tools/download_weights.sh
+```
+
+Checkpoints go into the repository's `weights/` directory regardless of the
+calling directory. Existing nonempty files are skipped; failed downloads stop
+the script and their temporary files are removed. Darknet53 is excluded. For
+fine-tuning, pass the matching checkpoint, for example
+`-n yolox-nano -c weights/yolox_nano.pth`, without `--resume`.
+Existing files are not integrity-checked; see
+[model asset provenance](docs/model_assets.md) before loading weights.
+
 Use the existing [Quick Start training instructions](#quick-start) with a CUDA environment.
 For example, resume the latest checkpoint in an experiment's output directory,
 or select one explicitly:
