@@ -268,7 +268,7 @@ def install_export(monkeypatch, data):
                 assert project_id == 42
                 return self
 
-            def export_dataset(self, format_name, destination, *, include_images, location):
+            def export_dataset(self, format_name, destination, *, include_images, location, pbar):
                 assert format_name == "COCO 1.0" and include_images is False
                 assert location == Location.LOCAL
                 assert destination.parent.is_dir()
@@ -285,6 +285,9 @@ def install_export(monkeypatch, data):
                         for a in subset["annotations"]:
                             a["image_id"] = remap[a["image_id"]]
                         bundle.writestr(f"annotations/instances_{index}.json", json.dumps(subset))
+                size = destination.stat().st_size
+                with pbar.task(total=size, desc="Downloading", unit="B", unit_scale=True):
+                    pbar.advance(size)
         return Client()
 
     monkeypatch.setattr(cvat_sdk, "make_client", make_client)
@@ -369,9 +372,9 @@ def test_output_on_share_and_single_ride_rejected(lan, synthetic, tmp_path, monk
 
 @pytest.mark.parametrize("failure", [
     None, "network", "mount", "mount-partial", "mount-sigterm", "preflight", "exception",
-    "ctrl-c", "sigterm", "spawn-sigterm", "umount", "umount-oserror", "workers",
+    "ctrl-c", "sigterm", "spawn-sigterm", "umount", "umount-oserror", "workers", "trainer-exit",
 ])
-def test_supervised_mount_lifecycle(tmp_path, monkeypatch, capsys, failure, run_config):
+def test_supervised_mount_lifecycle(tmp_path, monkeypatch, capsys, failure, run_config, synthetic):
     import os
     import signal
     from tools import train_cvat
@@ -383,7 +386,7 @@ def test_supervised_mount_lifecycle(tmp_path, monkeypatch, capsys, failure, run_
     monkeypatch.setattr(train_cvat.ctypes, "CDLL", lambda *a, **kw: SimpleNamespace(prctl=lambda *a: 0))
     monkeypatch.setattr(train_cvat, "check_local", lambda path: None)
     monkeypatch.setattr(train_cvat, "export_project", lambda *args: None)
-    monkeypatch.setattr(train_cvat, "read_export", lambda *args: {})
+    monkeypatch.setattr(train_cvat, "read_export", lambda *args: synthetic)
     monkeypatch.setattr(train_cvat, "check_cache_space", lambda *args: None)
 
     original_mkdtemp = train_cvat.tempfile.mkdtemp
@@ -455,7 +458,7 @@ def test_supervised_mount_lifecycle(tmp_path, monkeypatch, capsys, failure, run_
                 raise RuntimeError("trainer failed")
             if failure in {"ctrl-c", "sigterm"}:
                 signal.raise_signal(signal.SIGINT if failure == "ctrl-c" else signal.SIGTERM)
-            return 0
+            return 3 if failure == "trainer-exit" else 0
 
     monkeypatch.setattr(subprocess, "Popen", Process)
 
@@ -471,10 +474,21 @@ def test_supervised_mount_lifecycle(tmp_path, monkeypatch, capsys, failure, run_
         with pytest.raises((ValueError, subprocess.CalledProcessError, RuntimeError, KeyboardInterrupt)):
             train_cvat.run_training(run_config)
     else:
-        assert train_cvat.run_training(run_config) == (1 if failure in {"umount", "umount-oserror", "workers"} else 0)
+        expected = 3 if failure == "trainer-exit" else 1 if failure in {"umount", "umount-oserror", "workers"} else 0
+        assert train_cvat.run_training(run_config) == expected
+    captured = capsys.readouterr()
+    status = ("completed" if failure is None else "interrupted"
+              if failure in {"ctrl-c", "sigterm", "mount-sigterm", "spawn-sigterm"} else "failed")
+    assert f"Run summary — {status}" in captured.out
+    assert "Total elapsed (including cleanup):" in captured.out
+    for summary_path in Path(run_config["dataset"]["output_dir"]).glob("*/summary.json"):
+        summary = json.loads(summary_path.read_text())
+        assert summary["status"] == status
+        assert summary["phases"][-1]["name"] == "Worker and mount cleanup"
+        assert sum(phase["seconds"] for phase in summary["phases"]) + summary["overhead_seconds"] == pytest.approx(summary["total_seconds"])
     if failure in {"umount", "umount-oserror", "workers"}:
         assert state["mounted"] and mountpoint.exists()
-        message = capsys.readouterr().err
+        message = captured.err
         assert f"192.0.2.10:/ at {mountpoint}" in message
         assert f"sudo umount -- {mountpoint}" in message
         assert f"rmdir -- {mountpoint}" in message
@@ -791,11 +805,12 @@ def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_confi
     import os
     from tools import train_cvat
 
+    synthetic["annotations"][-1]["category_id"] = 2
     install_export(monkeypatch, synthetic)
     config_path = tmp_path / "run.toml"
     config_path.write_text(f'[cvat]\nhost = "{HOST}"\nproject_id = 42\n'
                            f'[nfs]\nserver = "192.0.2.10"\nframe_root = "{lan.root}"\n'
-                           '[dataset]\noutput_dir = "runs"\n', encoding="utf-8")
+                           '[dataset]\noutput_dir = "runs"\n[classes]\nexclude = ["person"]\n', encoding="utf-8")
     if credential_source == "dotenv":
         monkeypatch.delenv("CVAT_ACCESS_TOKEN")
     file_token = "test-pat-not-a-real-secret" if credential_source == "dotenv" else "wrong-file-token"
@@ -828,7 +843,33 @@ def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_confi
     monkeypatch.setattr(subprocess, "Popen", launch)
     assert train_cvat.main() == 0
     assert sorted(opened) == sorted(image["file_name"] for image in synthetic["images"])
-    assert "test-pat-not-a-real-secret" not in str(capsys.readouterr())
+    captured = capsys.readouterr()
+    assert "test-pat-not-a-real-secret" not in str(captured)
+    assert "Export contains 4 images" in captured.out
+    assert "Preparation complete after" in captured.out
+    assert "Run elapsed (including cleanup):" in captured.out
+    assert "Downloading: 100%" in captured.err
+    assert "Validating images: 100%" in captured.err and "4/4" in captured.err
+    summary_path, = Path(run_config["dataset"]["output_dir"]).glob("*/summary.json")
+    summary = json.loads(summary_path.read_text())
+    assert summary["status"] == "completed" and summary["trainer_exit_code"] == 0
+    assert summary["source"]["frames"] == 4 and summary["source"]["boxes"] == 4
+    assert summary["source"]["boxes_per_class"] == {"car": 3, "person": 1}
+    assert summary["dataset"]["retained_boxes"] == 3 and summary["dataset"]["excluded_boxes"] == 1
+    assert summary["dataset"]["classes"] == ["car"]
+    for split, expected_boxes, expected_empty in [("train", 1, 1), ("val", 2, 0)]:
+        stats = summary["dataset"]["splits"][split]
+        assert (stats["frames"], stats["boxes"], stats["empty_frames"]) == (2, expected_boxes, expected_empty)
+        assert stats["boxes_per_class"] == {"car": expected_boxes}
+    stats = summary["validation"]
+    assert stats["status"] == "complete" and stats["completed_frames"] == 4 and stats["invalid_frames"] == 0
+    assert stats["frames_per_second"] == pytest.approx(4 / stats["wall_seconds"])
+    assert stats["wall_ms_per_frame"] == pytest.approx(stats["wall_seconds"] * 250)
+    latency = stats["worker_latency_ms"]
+    assert 0 <= latency["min"] <= latency["median"] <= latency["p95"] == latency["max"]
+    assert latency["min"] <= latency["mean"] <= latency["max"]
+    assert summary["cleanup"] == {"workers_exited": True, "owned_mount": False, "unmounted": None}
+    assert sum(phase["seconds"] for phase in summary["phases"]) + summary["overhead_seconds"] == pytest.approx(summary["total_seconds"])
     assert not any("test-pat-not-a-real-secret" in path.read_text()
                    for path in Path(run_config["dataset"]["output_dir"]).rglob("*.json"))
 

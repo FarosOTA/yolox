@@ -268,8 +268,43 @@ video-task `frame_000000.jpg` names require external mapping and fail.
 Only exported images are read: no recursive frame scan, sibling folders or
 unlisted images enter training. Every listed path must be a readable, regular,
 non-empty file confined to the frame root. Stats and Pillow header reads run
-in parallel (16 workers by default); dimensions must match JSON. Header reads
-use an explicit 8 KiB Python buffer rather than the filesystem's default
+in parallel (16 workers by default); dimensions must match JSON. Validation checks
+report completed images, percentage, elapsed time, throughput and estimated time
+remaining, plus an error counter when errors are found. Updates are throttled
+to about once a second while work completes, with an immediate initial and final
+display. Completed checks count even when an earlier image is slow; the final
+error list remains in export order. Progress bars go to stderr and remain enabled
+for redirected output. Phase messages on stdout are flushed immediately; the
+supervisor reports preparation and total elapsed time including cleanup.
+CVAT export announces the server-preparation wait (no percentage/ETA is available
+for that wait), then reports download progress and total export time.
+
+The supervisor prints a summary on completion, failure or handled interruption.
+It includes model/checkpoint/cache settings and resolved epochs, dimensions and
+worker counts; source frame/box/class counts; retained/excluded boxes; and train/val
+frames, empty frames, rides and per-class box counts. Phase durations and percentages
+are **exclusive wall times**, not overlapping parent/child timers: local/LAN
+preflight, export/download, annotation parsing, experiment/cache capacity, optional
+mount, mounted-source preflight, image validation, class mapping/splitting, dataset
+and config writing, trainer subprocess, and cleanup. Other setup/reporting overhead
+is shown separately so the breakdown accounts for total elapsed time. Measurement
+ends after cleanup, before rendering/saving the summary. Trainer subprocess time
+includes startup, caching, epochs and evaluation; it is **not** a separate measurement
+of GPU compute or individual training phases. Existing trainer logs retain iteration
+timing, ETA and evaluation metrics.
+
+Frame statistics describe **validation**, not training/inference performance:
+completed/total checks, valid/invalid counts, mode and workers, frames/s, wall-clock
+ms per completed frame, and per-worker check latency min/mean/median/p95/max in ms.
+Worker latency excludes queue wait; wall averages include parallelism and validation
+overhead. P95 uses the nearest-rank definition. On interruption, counts and latency
+samples include only completions observed by the progress loop; checks finishing
+during executor shutdown are not added. Partial or unreached phases are not reported
+as completed work. Cleanup failures make the overall result failed, even if the
+trainer exited successfully. Errors identify the phase/type without recording raw
+exception text or credentials. Hard kills/process crashes cannot guarantee a summary.
+
+Header reads use an explicit 8 KiB Python buffer rather than the filesystem's default
 (which can be much larger on NFS). This is a buffer size, not a header-size
 limit: JPEGs with large APP/EXIF segments can read additional buffers. It does
 not control kernel/NFS readahead. Opt-in full decoding keeps normal buffering.
@@ -294,6 +329,7 @@ Each unique run folder contains:
 - `classes.json` in model index order and `class_mapping.json` with each source id/name, target name/id/index;
 - `prepared.json` with server/project, NFS, split and class metadata;
 - `resolved_config.json` with validated defaults, resolved paths, grouped merges and generated training arguments (no PAT or raw config comments);
+- `summary.json` after supervised cleanup, with the run outcome, phase durations, frame statistics, dataset counts and cleanup result; failures before a run directory is created print only a terminal summary;
 - transient `validation.json` for the one-use supervisor-to-launcher handoff (a random handoff identifier, **not** a CVAT PAT; consumed by the launcher);
 - local `cache_train2017` when using disk cache and `training/` for model outputs.
 

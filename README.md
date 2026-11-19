@@ -181,7 +181,14 @@ training, use the existing training CLI's `--resume` with an explicit checkpoint
 and persistent prepared data as described in the guide.
 
 The supervisor checks LAN routes, NFS source/options, exported image headers,
-class mapping and local cache capacity before training. It temporarily mounts
+class mapping and local cache capacity before training. Flushed phase messages,
+export-download and image-validation progress bars, and elapsed timings make
+preparation visible even with redirected output. Validation reports completed
+images, throughput, ETA and detected error count. An end-of-run summary reports
+success/failure/interruption, exclusive phase timings, total elapsed time including
+cleanup, source/final class and split counts, and per-frame validation statistics.
+It is saved as `summary.json` when the run directory exists; see the guide for
+timing definitions and partial-run limitations. The supervisor temporarily mounts
 NFS using non-interactive sudo and waits for workers before unmounting on
 completion, failure or interruption; cleanup failures retain the mount and
 print recovery commands. `nfs.frame_root` instead reuses an existing mount
