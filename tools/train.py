@@ -19,6 +19,10 @@ def make_parser():
     parser = argparse.ArgumentParser("YOLOX train parser")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
+    parser.add_argument(
+        "--prepared-data", default=None,
+        help="Local CVAT prepared directory; rerun LAN/data preflight before training",
+    )
 
     # distributed
     parser.add_argument(
@@ -123,6 +127,9 @@ if __name__ == "__main__":
     args = make_parser().parse_args()
     exp = get_exp(args.exp_file, args.name)
     exp.merge(args.opts)
+    if args.prepared_data:
+        from yolox.data.cvat import configure_training
+        configure_training(exp, args.prepared_data, cache=args.cache)
     check_exp_value(exp)
 
     if not args.experiment_name:

@@ -1,38 +1,22 @@
+# Run: uv run --no-sync python tools/train_cvat.py train.toml
+# Paths are relative to this file; output defaults to datasets/cvat-runs/.
+# Supply the PAT via CVAT_ACCESS_TOKEN or the hidden prompt, never this file.
+
 [cvat]
 host = "https://cvat.example.com"
 project_id = 42
 
 [nfs]
 server = "192.0.2.10"
-export = "/"
-options = ["ro", "vers=4.2", "proto=tcp"]
 # Reuse an existing mount instead:
 # frame_root = "/mnt/training-frames"
 
-[dataset]
-output_dir = "../../datasets/cvat-runs"
-val_fraction = 0.2
-seed = 0
-validation_workers = 16
-full_decode = false
-
 [training]
 model = "yolox-nano"
-# Alternatively:
-# exp_file = "../../exps/default/yolox_nano.py"
-devices = 1
-batch = 8
-fp16 = false
-cache = "disk"
-resume = false
-# checkpoint = "../../YOLOX_outputs/previous/latest_ckpt.pth"
+# Optional COCO-pretrained weights; omit to train from scratch.
+# checkpoint = "weights/yolox_nano.pth"
 
-[training.overrides]
-max_epoch = 100
-# input_size = [640, 640]
-# data_num_workers = 4
-
-[classes.merge]
 # Optional: target class = source labels.
+# [classes.merge]
 # vehicle = ["car", "truck", "bus"]
 # two_wheeler = ["bicycle", "motorcycle"]

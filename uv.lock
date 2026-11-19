@@ -545,6 +545,25 @@ nvtx = [
 ]
 
 [[package]]
+name = "cvat-sdk"
+version = "2.74.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "packaging" },
+    { name = "pillow" },
+    { name = "platformdirs" },
+    { name = "python-dateutil" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f7/1a/9b70818aa51bcbb023472ea96c87f33aeec7d46936e09340dec157452704/cvat_sdk-2.74.1.tar.gz", hash = "sha256:3b1827d2a17fff0d5029ba7d1751af88ed459df6a9126988ed82750bc31fdb25", size = 280784, upload-time = "2026-09-01T17:59:56.64Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6f/7b/e24bb3751b87858abe85f990a7be84a3a4cfdd0633340c332793ba83c3bd/cvat_sdk-2.74.1-py3-none-any.whl", hash = "sha256:501c3f4db9ad9e4ee2ac6f5972fa623351305041d871ef29dd2ea031886d4c45", size = 939556, upload-time = "2026-09-01T17:59:53.976Z" },
+]
+
+[[package]]
 name = "cwevals"
 version = "0.0.1b1"
 source = { registry = "https://pypi.org/simple" }
@@ -3383,6 +3402,7 @@ dependencies = [
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "packaging" },
+    { name = "pillow" },
     { name = "psutil" },
     { name = "pycocotools" },
     { name = "tabulate" },
@@ -3409,6 +3429,9 @@ cpu = [
 cuda = [
     { name = "torch", version = "2.14.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform != 'darwin'" },
     { name = "torchvision", version = "0.29.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform != 'darwin'" },
+]
+cvat = [
+    { name = "cvat-sdk" },
 ]
 export = [
     { name = "onnx" },
@@ -3440,6 +3463,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cvat-sdk", marker = "extra == 'cvat'", specifier = ">=2.74.1,<2.75" },
     { name = "loguru", specifier = ">=0.7,<1" },
     { name = "mlflow", marker = "extra == 'mlflow'", specifier = ">=2.20,<4" },
     { name = "ninja", specifier = ">=1.11,<2" },
@@ -3449,6 +3473,7 @@ requires-dist = [
     { name = "onnxsim", marker = "extra == 'export'", specifier = ">=0.4.36,<1" },
     { name = "opencv-python", specifier = ">=4.10,<5" },
     { name = "packaging", specifier = ">=24" },
+    { name = "pillow", specifier = ">=10,<14" },
     { name = "psutil", specifier = ">=5.9,<8" },
     { name = "pycocotools", specifier = ">=2.0.8,<3" },
     { name = "python-dotenv", marker = "extra == 'mlflow'", specifier = ">=1,<2" },
@@ -3464,7 +3489,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.66,<5" },
     { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.19,<1" },
 ]
-provides-extras = ["export", "mlflow", "wandb", "cpu", "cuda"]
+provides-extras = ["cvat", "export", "mlflow", "wandb", "cpu", "cuda"]
 
 [package.metadata.requires-dev]
 dev = [

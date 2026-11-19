@@ -20,7 +20,7 @@ jobs:
           version: "0.12.9"
           python-version: ${{ matrix.python }}
           enable-cache: true
-      - run: uv sync --locked --extra cpu --extra export
+      - run: uv sync --locked --extra cpu --extra export --extra cvat
       - run: uv run --no-sync ruff check yolox tools tests setup.py
       - run: uv run --no-sync pytest -q
       - run: uv build

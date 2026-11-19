@@ -16,6 +16,7 @@ toolchain assumptions in the retained upstream material.
 - [Installation and compatibility](#installation-and-compatibility)
 - [Training, resume and distributed evaluation](#training-resume-and-distributed-evaluation)
 - [Experiments, datasets and utility APIs](#experiments-datasets-and-utility-apis)
+- [CVAT and LAN training data](#cvat-and-lan-training-data)
 - [Interactive and headless demos](#interactive-and-headless-demos)
 - [Export and portable ONNX inference](#export-and-portable-onnx-inference)
 - [Reference deployment integrations](#reference-deployment-integrations)
@@ -146,6 +147,48 @@ uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 --resume -c path/
   when the context raises; recursive `replace_module(..., replace_func=...)`
   forwards the custom callback to nested modules. Fine-tuning `load_ckpt` can
   remove a uniform legacy DDP prefix when no unprefixed keys match.
+
+## CVAT and LAN training data
+
+This fork adds `tools/train_cvat.py` for Linux: export a CVAT project's
+**COCO 1.0 annotations without images**, read listed frames over read-only
+NFSv4, split by ride and supervise normal-user training. Install the optional
+SDK and copy the [minimal run template](train.toml.example):
+
+```sh
+uv sync --locked --extra cuda --extra export --extra cvat
+cp train.toml.example train.toml
+# Edit the CVAT host/project and NFS server in train.toml first.
+sudo -v
+uv run --no-sync python tools/train_cvat.py train.toml
+```
+
+`train.toml` is gitignored. Paths resolve relative to the TOML file, so a
+root-level config defaults to output under `datasets/cvat-runs` and uses
+`weights/yolox_nano.pth` without `../../` for optional pretrained weights.
+The template keeps project/source, model and epoch choices explicit, with optional
+checkpoint and class-merge examples commented out. Batch size defaults to 8;
+routine defaults and advanced overrides are documented in
+the [CVAT/LAN guide](docs/cvat_training_data.md). Supply the PAT only through
+`CVAT_ACCESS_TOKEN` or the hidden prompt, never the config or CLI arguments.
+
+Each invocation starts a **new run**, optionally fine-tuning from
+`training.checkpoint`; omitting it trains from scratch, with no automatic
+download. There is no `training.resume` setting. To continue interrupted
+training, use the existing training CLI's `--resume` with an explicit checkpoint
+and persistent prepared data as described in the guide.
+
+The supervisor checks LAN routes, NFS source/options, exported image headers,
+class mapping and local cache capacity before training. It temporarily mounts
+NFS using non-interactive sudo and waits for workers before unmounting on
+completion, failure or interruption; cleanup failures retain the mount and
+print recovery commands. `nfs.frame_root` instead reuses an existing mount
+without managing it; skip `sudo -v` in that mode. Never run training as root.
+Run records, cache and checkpoints stay in unique local run folders. Optional
+`[classes.merge]` groups preserve all annotations and write the final mapping
+for both splits and evaluation. `tools/prepare_cvat.py` offers standalone
+preparation and preflight checks. Networking/mounts are fixture-tested; a live
+CVAT/NFS connection and CUDA training are not established by those tests.
 
 ## Interactive and headless demos
 

@@ -1,0 +1,343 @@
+# CVAT annotations and LAN training frames
+
+This fork adds a Linux workflow that exports **COCO 1.0 annotations without
+images** using the optional `cvat-sdk` extra, reads only the exported filenames
+over read-only NFSv4, splits by ride, and supervises normal-user training.
+It can own a temporary mount or reuse an existing mount. It never configures
+the server, copies the frame tree locally, or modifies source images.
+
+## Install and configure
+
+The training client needs Linux, `ip` (iproute2), `findmnt` (util-linux),
+readable `/sys/class/net/<interface>/{speed,duplex}`, and NFS mount helpers
+(for example `nfs-common`). The training CLI requires CUDA. Install with:
+
+```sh
+uv sync --locked --extra cuda --extra export --extra cvat
+```
+
+Use `--extra cpu` **instead of** `--extra cuda` for preparation and tests without
+a compatible NVIDIA driver. The SDK is constrained to CVAT 2.74 and locked to
+2.74.1. Preflight-only checks need neither the SDK nor a PAT.
+
+Copy the [minimal example](../train.toml.example) to a private root-level config:
+
+```sh
+cp train.toml.example train.toml
+```
+
+Edit the placeholders before running. `train.toml` and
+`configs/cvat/*.local.toml` are gitignored;
+a config outside the repository works too. **Never put a PAT in the config,
+even in comments.** The example uses reserved documentation addresses, not
+routable deployment defaults. The workflow has **no default CVAT host, project
+ID or NFS server**. Keep real configs, run records and annotations out of version
+control; the default example output lives under ignored `datasets/`.
+
+The only supervisor argument is the TOML config path:
+
+```sh
+sudo -v
+uv run --no-sync python tools/train_cvat.py train.toml
+```
+
+Run as your **normal user**, never with sudo around Python. `sudo -v` is a
+separate interactive authentication step for temporary mounting; omit it for
+an already-mounted share. The workflow uses `sudo -n` and will **not prompt
+for a sudo password** in interactive or non-interactive sessions.
+
+### Config tables
+
+All filesystem paths resolve relative to the config's parent directory, not
+the shell's working directory. Unknown tables, keys and experiment override
+names fail before network or credential operations, so typos cannot silently
+use defaults.
+
+The example keeps only the usual per-run choices visible. Output location,
+batch size, NFS export/options, validation tuning, GPU count, precision and cache mode are optional advanced
+settings; omit them to use the defaults below. A root-level config uses paths
+such as `datasets/cvat-runs` and `weights/yolox_nano.pth`, without `../../`.
+
+| Table | Settings |
+| --- | --- |
+| `cvat` | Required HTTPS `host` and positive integer `project_id`. Keep the hostname for TLS; no credentials, path or query in the URL. |
+| `nfs` | Required LAN IPv4 `server`; `export` defaults to `/`; `options` defaults to `["ro", "vers=4.2", "proto=tcp"]`. These three options are mandatory; only `nosuid`, `nodev`, `noexec`, `hard` may be added. Optional `frame_root` reuses an existing mount and never mounts/unmounts it. |
+| `dataset` | Local `output_dir` base (default `datasets/cvat-runs`), `val_fraction` (default 0.2), integer `seed` (default 0), `validation_workers` (16, allowed 1–128), `full_decode` (false). Each invocation creates a unique UTC timestamp/UUID run folder. |
+| `training` | `model` (default `yolox-nano`) **or** `exp_file`, `devices` (1), `batch` (8), `fp16` (false), `cache` (`disk`, `ram` or `none`), optional `checkpoint` for fine-tuning. There is no `resume` setting. |
+| `training.overrides` | Experiment settings such as `max_epoch = 100`, `input_size = [640, 640]` and `data_num_workers = 4`. The example selects 100 epochs; omitting this override keeps the selected experiment's default (300 for Nano). Dataset paths, class count and output directory are managed by the workflow, not overridable here. |
+| `classes.merge` | Optional target-class groups as described below. No class dropping. |
+
+Model checkpoints/logs go under `<run>/training`. Disk caches stay in the
+local run folder, not on NFS. Every supervisor invocation starts a new run:
+`training.checkpoint` initializes compatible model weights, not the optimizer,
+epoch or training state. Omit it to train from scratch; weights are not
+downloaded automatically. Old configs containing `training.resume` are rejected
+rather than silently changing their meaning. For continuation, use the lower-level
+training CLI's `--resume` with persistent prepared data (see below).
+Use experiments honoring `data_dir`, `train_ann`, `val_ann` and `num_classes`.
+
+### Class merging and deterministic indices
+
+Any number of target groups is supported:
+
+```toml
+[classes.merge]
+vehicle = ["car", "truck", "bus"]
+two_wheeler = ["bicycle", "motorcycle"]
+```
+
+Unlisted labels retain their names. Unknown source labels, empty groups and
+sources appearing in multiple groups fail with explicit errors. An existing
+CVAT label cannot be a target unless explicitly listed in its own group:
+if `vehicle` already exists, use `vehicle = ["vehicle", "car", "truck", "bus"]`.
+This prevents accidental merging of an untouched class into a group.
+
+Class order follows the **first occurrence of each final class while walking
+original categories in ascending CVAT category-id order**. It does not depend
+on TOML group order or source-array order. For source ids `car=1`, `person=3`,
+`truck=4`, `bicycle=7`, `motorcycle=9`, `cone=11`, `bus=12`, the above groups
+produce `["vehicle", "person", "two_wheeler", "cone"]` at indices 0–3.
+An untouched label's index can shift when preceding labels merge.
+
+With merging enabled, categories are renumbered 1–N and every annotation's
+`category_id` is rewritten in **both** train and validation JSON. Without
+merges, sorted original category ids are retained. `classes.json`, reported
+`num_classes`, loaders and per-class AP all use the final names/indices.
+Every original box is retained; this feature does not turn excluded objects
+into background. The final source-to-class mapping is printed and saved.
+
+## Credentials and temporary export
+
+Provide `CVAT_ACCESS_TOKEN` through a secure environment, or enter the PAT at
+the hidden prompt. For a Bash session, with tracing disabled:
+
+```sh
+set +x
+read -r -s -p 'CVAT PAT: ' CVAT_ACCESS_TOKEN; printf '\n'
+export CVAT_ACCESS_TOKEN
+# Run the workflow, then:
+unset CVAT_ACCESS_TOKEN
+```
+
+There is no token CLI argument or config field. Never put the PAT in URLs,
+scripts, files, logs or shell history. A terminal without secure no-echo input
+fails rather than falling back to echoed input. SDK failures show the HTTP
+status and its standard description when available; response bodies, headers
+and raw exception strings remain suppressed because they may echo credentials.
+HTTP 429/500/502/503/504 failures retry once after three seconds, removing a
+partial archive first. The first failure warns and repeated failure is an
+error; authentication failures and opaque transport errors do not retry.
+This does not diagnose the cause of a transient server failure. TLS verification stays
+enabled; install a trusted CA if needed, rather than using a bare IP or
+disabling verification. The SDK exports the project as COCO 1.0 without images
+into a temporary directory removed on success or failure.
+
+## Network checks and mount lifecycle
+
+Before mounting, both the CVAT hostname and NFS server must resolve entirely
+to private LAN addresses and have on-link routes without gateways. Every
+IPv4/IPv6 answer is checked; a good answer cannot mask a bad one. Tailscale
+ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), `tailscale0`, loopback/local
+routes, public answers and gateway routes fail. Merely having Tailscale
+enabled does not fail if actual traffic stays on the LAN.
+
+A public DNS answer emits a **possible NAT hairpinning** warning before
+failing. Routing alone cannot prove NAT. Use local DNS or an `/etc/hosts`
+entry to map the HTTPS hostname to the LAN server, for example
+`192.0.2.10 cvat.example.com` (replace both documentation placeholders).
+
+Speed and duplex are read on each interface selected by `ip -j route get`.
+Below 1000 Mb/s, half/unknown duplex or unavailable metadata warns rather
+than fails. The client cannot measure the server NIC, switch uplinks or
+end-to-end throughput. A TCP connection to the checked NFS server on port
+2049 must succeed (five-second timeout) **before mounting**. This is a
+reachability check, not an NFS RPC handshake. NFSv4-only servers do not need
+rpcbind/111 or network mountd; `showmount` is not a precondition.
+
+Temporary mode creates a private directory and runs only the mount/unmount
+operations through `sudo -n`. An administrator must authorize those
+operations beforehand for unattended use. No sudoers configuration is
+installed and no wildcard rule for user-controlled temporary paths is
+recommended. Cached sudo authorization may expire during long training;
+cleanup then retains the mount and prints manual recovery instructions.
+Training and DataLoader workers never run as root.
+
+After mounting, preflight requires `findmnt` to report `nfs4`, the configured
+`server:export`, `ro` and `proto=tcp`. The mounted `addr=` is also checked
+on-link and must match the configured server. Image checks then run before
+training. The launcher rechecks network/mount and local metadata before caching
+and worker launch, but consumes the supervisor's one-use validation record to
+avoid a second image pass. The record binds SHA-256 hashes of both annotation
+JSONs and class/provenance metadata to the frame root, filesystem device/inode,
+mount ID/options/source and mount namespace. It is not a reusable validation
+cache: a missing/changed record, JSON or mount triggers image checks again.
+Standalone `--prepared-data` invocations without the supervisor handoff always
+check images. Nothing detects source-file mutation after validation; keep the
+share immutable throughout a run.
+
+On normal completion, exceptions, failed preflight, Ctrl-C or SIGTERM, the
+supervisor terminates the training process group and waits/reaps DataLoader
+descendants, including orphans via Linux subreaper support, **before unmount**.
+Shutdown allows ten seconds for SIGTERM then ten seconds for SIGKILL.
+Signals during mount/spawn are deferred until the helper/child is tracked;
+additional interrupts during cleanup are ignored. It never lazy/force
+unmounts underneath workers. Stuck workers or failed unmount leave the
+mountpoint intact and report the exact source, target and recovery commands:
+`sudo umount -- <mountpoint>` then `rmdir -- <mountpoint>` after workers exit.
+SIGKILL of the supervisor, power loss or kernel failure cannot run cleanup;
+inspect `findmnt` for `yolox-nfs-*` mountpoints after such an interruption.
+
+Run records remain after shutdown, but temporary-mode image symlinks and the
+recorded frame root refer to the removed mount. Start a new supervised run
+rather than reusing those links. For persistent prepared data, set
+`nfs.frame_root` and manage that mount separately.
+
+## Existing mount and optional NFS setup
+
+For an assets-only export with `fsid=0`, mount `server:/`, **not** its
+server-side path. Example manual client setup (replace the documentation IP):
+
+```sh
+sudo mkdir -p /mnt/training-frames
+sudo mount -t nfs -o ro,vers=4.2,proto=tcp 192.0.2.10:/ /mnt/training-frames
+findmnt -T /mnt/training-frames -o TARGET,SOURCE,FSTYPE,OPTIONS
+```
+
+Set `frame_root = "/mnt/training-frames"` under `[nfs]`. The workflow never
+unmounts a user-supplied root. Optional administrator-managed `/etc/fstab`:
+
+```text
+192.0.2.10:/ /mnt/training-frames nfs ro,vers=4.2,proto=tcp,_netdev,nofail,x-systemd.automount 0 0
+```
+
+Systemd may mount this on first access; that is configured system behavior,
+not the workflow mounting an existing root. For a manual-only mount omit
+the fstab entry. A server administrator can optionally export only the
+assets directory read-only to the training client, for example:
+
+```text
+/srv/training-assets 192.0.2.15(ro,sync,no_subtree_check,all_squash,anonuid=65534,anongid=65534,fsid=0)
+```
+
+Configure NFSv4/TCP-only and firewall access to trusted clients separately;
+this tool does not change exports/services/firewalls and has no CIFS path.
+AUTH_SYS is neither encryption nor strong client authentication.
+`all_squash` maps reads to nobody (UID/GID 65534). Traversal/read permissions
+must allow that identity; permission errors name this mapping. Running
+training as root does not bypass it.
+
+## Dataset checks and run records
+
+Filenames must be ride-relative, for example
+`20250101_120000/20250101_120000_0123abcd.jpg`, resolving directly under the
+configured root. No extra `assets` prefix is inserted or stripped. Bare
+video-task `frame_000000.jpg` names require external mapping and fail.
+Only exported images are read: no recursive frame scan, sibling folders or
+unlisted images enter training. Every listed path must be a readable, regular,
+non-empty file confined to the frame root. Stats and Pillow header reads run
+in parallel (16 workers by default); dimensions must match JSON. Header reads
+use an explicit 8 KiB Python buffer rather than the filesystem's default
+(which can be much larger on NFS). This is a buffer size, not a header-size
+limit: JPEGs with large APP/EXIF segments can read additional buffers. It does
+not control kernel/NFS readahead. Opt-in full decoding keeps normal buffering.
+No pixels are decoded in the default mode. Invalid/truncated headers, dimension
+mismatches, path traversal and escaping symlinks fail. Header checks cannot
+detect corruption in pixel payloads; set `dataset.full_decode = true` for
+slower full decoding, still in parallel and once per supervised run. Up to 20 image
+errors are printed with the total count. Repair bad images or deliberately
+exclude them in CVAT; nothing is silently skipped.
+
+COCO subsets are combined with image/annotation ids remapped. Duplicate
+filenames/ids, inconsistent categories and unknown references fail. A seeded
+shuffle of sorted ride directories selects `ceil(rides × val_fraction)`
+validation rides, clamped to leave at least one per split. At least two rides
+are required. This is **not** a frame-level fraction; neighbouring frames
+stay together to avoid leakage. Unannotated exported images remain included.
+
+Each unique run folder contains:
+
+- `annotations/instances_train2017.json` and `instances_val2017.json`;
+- `train2017` and `val2017` symlinks to the same frame root, with distinct JSON selections;
+- `classes.json` in model index order and `class_mapping.json` with each source id/name, target name/id/index;
+- `prepared.json` with server/project, NFS, split and class metadata;
+- `resolved_config.json` with validated defaults, resolved paths, grouped merges and generated training arguments (no PAT or raw config comments);
+- transient `validation.json` for the one-use supervisor-to-launcher handoff (a random handoff identifier, **not** a CVAT PAT; consumed by the launcher);
+- local `cache_train2017` when using disk cache and `training/` for model outputs.
+
+Records are private operational data even without tokens. Do not commit them.
+Caches/output must be local; network filesystems and cache symlinks fail.
+Existing YOLOX caches are not content-addressed: do not mutate data during a
+run or reuse stale caches after image changes. Preflight is a point-in-time
+check, not a snapshot.
+
+For disk caching, the supervisor exports annotations **before mounting** and
+estimates resized uint8 HWC array bytes using each listed image's dimensions,
+the ride split and resolved experiment `input_size`/`test_size`. It includes
+128 bytes per NPY header and 10% headroom, compares with free space on the
+local output filesystem, and fails before mounting/training if insufficient.
+The standard experiment currently caches only training images: the reported
+validation amount is a conservative reserve, not an extra cache it creates.
+The launcher rechecks capacity before caching, including standalone
+`--prepared-data --cache disk` use. The estimate does not reserve disk space
+or budget checkpoints/logs indefinitely; free space can change concurrently.
+Free space, select a larger local output filesystem, lower the configured
+resolutions, or set `training.cache = "none"` when capacity is insufficient.
+
+## Standalone preparation and rechecks
+
+The lower-level existing-mount tool requires a new local output directory;
+the supervisor above creates it automatically. This tool does not merge
+classes; use the TOML supervisor for per-run merging.
+
+```sh
+uv run --no-sync python tools/prepare_cvat.py prepare \
+  --cvat-host https://cvat.example.com --project-id 42 \
+  --nfs-server 192.0.2.10 --nfs-export / \
+  --frame-root /mnt/training-frames --output datasets/prepared-cvat
+uv run --no-sync python tools/prepare_cvat.py check datasets/prepared-cvat
+uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 \
+  --prepared-data datasets/prepared-cvat --cache disk
+```
+
+Replace documentation placeholders. `--prepared-data` configures both dataset
+splits and class count after experiment overrides, and reruns preflight before
+cache/CUDA/distributed launch. Use it on resume and every training node.
+Without it, existing training behavior is unchanged. Checkpoints are not
+downloaded automatically.
+
+To resume interrupted training on persistent prepared data, keep the same
+experiment settings, classes, source data and split, and pass the checkpoint
+explicitly. For example:
+
+```sh
+uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 \
+  --prepared-data datasets/prepared-cvat --cache disk \
+  --resume -c path/to/latest_ckpt.pth
+```
+
+This is distinct from initializing a fresh supervised run with COCO weights.
+Temporary mounts removed by the supervisor are not persistent prepared data;
+use an existing mount/prepared directory whose image links remain valid.
+
+## Validation scope
+
+Tests use fake networking/mounts and a synthetic multi-subset COCO export,
+real decoded images, YOLOX train/validation loaders, local disk caching and
+COCO evaluation. They cover gateway/Tailscale/hairpin rejection, link warnings,
+image failures, permissions, config typos/paths, grouped merging/order/AP
+names, unique runs/records, and lifecycle cleanup including signals, partial
+mount failure, stuck workers and failed unmount. A repository privacy test
+scans tracked and non-ignored new files. SDK tests need the `cvat` extra;
+Linux workflow tests skip on other platforms.
+
+```sh
+uv sync --locked --extra cpu --extra export --extra cvat
+uv run --no-sync pytest -q
+uv run --no-sync ruff check .
+uv lock --check
+git diff --check
+```
+
+Tests do not establish a real NFS
+mount, CVAT connection, LAN throughput or a CUDA training run. A live client
+run must still validate its own mount and exported images before training.
