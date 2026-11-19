@@ -155,7 +155,8 @@ uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 --resume -c path/
 
 This fork adds `tools/train_cvat.py` for Linux: export selected CVAT tasks'
 **COCO 1.0 annotations without images**, read listed frames over read-only
-NFSv4, split by ride and supervise normal-user training. Install the optional
+NFSv4, split images 70% train / 15% validation / 15% held-out test, and supervise
+normal-user training. Install the optional
 SDK and copy the [minimal run template](train.toml.example):
 
 ```sh
@@ -170,8 +171,13 @@ uv run --no-sync python tools/train_cvat.py train.toml
 root-level config defaults to output under `datasets/cvat-runs` and uses
 `weights/yolox_nano.pth` without `../../` for optional pretrained weights.
 The template uses fixture task IDs: replace them with your actual `cvat.task_ids`.
-Only those tasks are exported; their frames are split by ride into training and
-validation (no separate test split). Legacy `cvat.project_id` configs still work,
+Only those tasks are exported. The fixed 70/15/15 image split applies to any
+selected tasks, with whole-image rounding. Seeded contiguous filename-ordered
+segments within rides reduce adjacent-frame mixing; this is not a ride-disjoint
+split and similar frames can remain across segment boundaries. Training uses
+train/validation only; labeled final test evaluation is available through
+`tools/eval.py --prepared-data <run> --split test` (not the COCO test-dev `--test` flag).
+Legacy `cvat.project_id` configs still work,
 but cannot be combined with `task_ids`.
 The template keeps task/source and model choices explicit, with optional
 checkpoint and class-merge examples commented out. Batch size defaults to 8;

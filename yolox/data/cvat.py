@@ -37,6 +37,8 @@ LAN_NETS = tuple(map(ipaddress.ip_network, (
 TAILSCALE_NETS = tuple(map(ipaddress.ip_network, ("100.64.0.0/10", "fd7a:115c:a1e0::/48")))
 TRAIN_JSON = "instances_train2017.json"
 VAL_JSON = "instances_val2017.json"
+TEST_JSON = "instances_test2017.json"
+SPLIT_FILES = {"train": TRAIN_JSON, "val": VAL_JSON, "test": TEST_JSON}
 
 
 class RunReport:
@@ -78,11 +80,12 @@ class RunReport:
             for split, stats in dataset["splits"].items():
                 print(f"  {split}: {stats['frames']} frames, {stats['boxes']} boxes, "
                       f"{stats['empty_frames']} empty frames; rides={stats['rides']}", flush=True)
-            print("Class                            Source     Train       Val (boxes)", flush=True)
+            print("Class                            Source     Train       Val      Test (boxes)", flush=True)
             for name in dict.fromkeys([*source["boxes_per_class"], *dataset["classes"]]):
                 train = dataset["splits"].get("train", {}).get("boxes_per_class", {}).get(name, 0)
                 val = dataset["splits"].get("val", {}).get("boxes_per_class", {}).get(name, 0)
-                print(f"  {name:<30} {source['boxes_per_class'].get(name, 0):8} {train:9} {val:9}", flush=True)
+                test = dataset["splits"].get("test", {}).get("boxes_per_class", {}).get(name, 0)
+                print(f"  {name:<30} {source['boxes_per_class'].get(name, 0):8} {train:9} {val:9} {test:9}", flush=True)
         if "cache_required_bytes" in self.data:
             print(f"Estimated cache requirement (with headroom): {self.data['cache_required_bytes']} bytes", flush=True)
         print("Cleanup: " + json.dumps(self.data["cleanup"]), flush=True)
@@ -343,6 +346,8 @@ def validation_fingerprint(directory, root):
     """Bind a one-use supervisor handoff to local metadata and this mounted filesystem."""
     files = ["prepared.json", "classes.json", "class_mapping.json",
              f"annotations/{TRAIN_JSON}", f"annotations/{VAL_JSON}"]
+    if "split_ratios" in json.loads((directory / "prepared.json").read_text()):
+        files.append(f"annotations/{TEST_JSON}")
     info = root.stat()
     return {
         "files": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in files},
@@ -365,27 +370,54 @@ def validation_handoff(directory, root, token):
     return saved == {"token": token, "fingerprint": validation_fingerprint(directory, root)}
 
 
-def validation_rides(data, val_fraction, seed):
-    rides = sorted({PurePosixPath(image["file_name"]).parts[0] for image in data["images"]})
-    if len(rides) < 2:
-        raise ValueError("At least two rides are required for a ride-disjoint train/val split")
-    random.Random(seed).shuffle(rides)
-    count = min(len(rides) - 1, max(1, math.ceil(len(rides) * val_fraction)))
-    return set(rides[:count]), set(rides[count:])
+def split_dataset(data, seed=0):
+    """Allocate 70/15/15 images using contiguous filename-ordered segments within each ride."""
+    total = len(data["images"])
+    if total < 3:
+        raise ValueError("At least three images are required for non-empty train/val/test splits")
+    percentages = {"train": 70, "val": 15, "test": 15}
+    remaining = {split: total * percent // 100 for split, percent in percentages.items()}
+    priority = sorted(percentages, key=lambda split: total * percentages[split] % 100, reverse=True)
+    for split in priority[:total - sum(remaining.values())]:
+        remaining[split] += 1
+    for split in ("val", "test"):
+        if remaining[split] == 0:
+            remaining["train"] -= 1
+            remaining[split] = 1
+    splits = {split: [] for split in SPLIT_FILES}
+    rides = {}
+    for image in sorted(data["images"], key=lambda image: image["file_name"]):
+        rides.setdefault(PurePosixPath(image["file_name"]).parts[0], []).append(image)
+    rng = random.Random(seed)
+    for images in rides.values():
+        # Largest-remainder allocation against remaining quotas keeps global counts exact.
+        count = len(images)
+        counts = {split: count * quota // total for split, quota in remaining.items()}
+        priority = sorted(remaining, key=lambda split: count * remaining[split] % total, reverse=True)
+        for split in priority[:count - sum(counts.values())]:
+            counts[split] += 1
+        order = list(splits)
+        rng.shuffle(order)
+        offset = 0
+        for split in order:
+            splits[split].extend(images[offset:offset + counts[split]])
+            offset += counts[split]
+            remaining[split] -= counts[split]
+        total -= count
+    return splits
 
 
-def check_cache_space(data, output, input_size, test_size, val_fraction=0.2, seed=0):
-    """Budget resized uint8 HWC arrays for both splits, NPY overhead and 10% headroom."""
-    val_rides, _ = validation_rides(data, val_fraction, seed)
+def check_cache_space(splits, output, input_size, test_size):
+    """Budget training/validation resized arrays, NPY overhead and 10% headroom; never test."""
     sizes = {"train": 0, "val": 0}
-    for image in data["images"]:
-        split = "val" if PurePosixPath(image["file_name"]).parts[0] in val_rides else "train"
-        height, width = image["height"], image["width"]
+    for split in sizes:
         target = test_size if split == "val" else input_size
-        if height <= 0 or width <= 0 or len(target) != 2 or min(target) <= 0:
-            raise ValueError("Image and cache target dimensions must be positive")
-        ratio = min(target[0] / height, target[1] / width)
-        sizes[split] += int(height * ratio) * int(width * ratio) * 3 + 128
+        for image in splits[split]:
+            height, width = image["height"], image["width"]
+            if height <= 0 or width <= 0 or len(target) != 2 or min(target) <= 0:
+                raise ValueError("Image and cache target dimensions must be positive")
+            ratio = min(target[0] / height, target[1] / width)
+            sizes[split] += int(height * ratio) * int(width * ratio) * 3 + 128
     required = math.ceil(sum(sizes.values()) * 1.1)
     location = Path(output).resolve()
     while not location.exists():
@@ -560,15 +592,13 @@ def merge_classes(data, merge, exclude=()):
     return mapping
 
 
-def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2, seed=0,
-                    *, nfs_server, merge=None, exclude=(), nfs_export="/", data=None,
+def prepare_dataset(cvat_host, project_id, frame_root, output, *, seed=0,
+                    nfs_server, merge=None, exclude=(), nfs_export="/", data=None,
                     workers=16, full_decode=False, validation_token=None, report=None,
                     task_ids=None):
     if report is not None:
         report.start_phase("Mounted source preflight")
     cvat_hostname(cvat_host)
-    if not 0 < val_fraction < 1:
-        raise ValueError("val-fraction must be between 0 and 1")
     output = Path(output).absolute()
     if output.exists() or output.is_symlink():
         raise ValueError("Output must not already exist; use a new local directory")
@@ -584,18 +614,19 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2,
     validate_coco(data, root, workers=workers, full_decode=full_decode,
                   stats=report.data["validation"] if report is not None else None)
     if report is not None:
-        report.start_phase("Class mapping and ride split")
+        report.start_phase("Class mapping and 70/15/15 split")
     mapping = merge_classes(data, merge or {}, exclude)
-    val_rides, train_rides = validation_rides(data, val_fraction, seed)
+    splits = split_dataset(data, seed)
+    rides = {split: sorted({PurePosixPath(image["file_name"]).parts[0] for image in images})
+             for split, images in splits.items()}
     if report is not None:
         report.data["dataset"] = {"classes": [category["name"] for category in data["categories"]],
                                   "retained_boxes": len(data["annotations"]), "splits": {}}
         report.start_phase("Writing prepared dataset")
     output.mkdir(parents=True)
     (output / "annotations").mkdir()
-    for split, filename in (("train", TRAIN_JSON), ("val", VAL_JSON)):
-        images = [image for image in data["images"]
-                  if (PurePosixPath(image["file_name"]).parts[0] in val_rides) == (split == "val")]
+    for split, filename in SPLIT_FILES.items():
+        images = splits[split]
         ids = {image["id"] for image in images}
         subset = {**data, "images": images, "annotations": [
             annotation for annotation in data["annotations"] if annotation["image_id"] in ids
@@ -609,7 +640,7 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2,
             report.data["dataset"]["splits"][split] = {
                 "frames": len(images), "boxes": len(subset["annotations"]),
                 "empty_frames": len(images) - len(labelled),
-                "rides": sorted(train_rides if split == "train" else val_rides),
+                "rides": rides[split],
                 "boxes_per_class": {category["name"]: counts[category["id"]]
                                     for category in data["categories"]},
             }
@@ -623,8 +654,11 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2,
     manifest = {
         "cvat_host": cvat_host, "project_id": project_id, "frame_root": str(root),
         "nfs_server": nfs_server, "nfs_export": nfs_export,
-        "num_classes": len(classes), "seed": seed, "val_fraction": val_fraction,
-        "train_rides": sorted(train_rides), "val_rides": sorted(val_rides),
+        "num_classes": len(classes), "seed": seed,
+        "split_ratios": {"train": 0.7, "val": 0.15, "test": 0.15},
+        "split_method": "contiguous_filename_segments_per_ride",
+        "split_counts": {split: len(images) for split, images in splits.items()},
+        **{f"{split}_rides": names for split, names in rides.items()},
         "validation_workers": workers, "full_decode": full_decode,
     }
     if task_ids is not None:
@@ -636,7 +670,7 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, val_fraction=0.2,
             "token": validation_token, "fingerprint": validation_fingerprint(output, root),
         }), encoding="utf-8")
     print(f"Prepared {len(data['images'])} images; num_classes={len(classes)}; classes={classes}", flush=True)
-    print(f"Train rides: {manifest['train_rides']}; validation rides: {manifest['val_rides']}", flush=True)
+    print(f"70/15/15 image split: {manifest['split_counts']}; seed={seed}", flush=True)
     return manifest
 
 
@@ -651,7 +685,8 @@ def preflight_dataset(directory, *, validation_token=None):
     if validated:
         print("Reusing supervisor image validation (matching mount and JSON hashes; one-use handoff)", flush=True)
     subsets = []
-    for split, filename in (("train", TRAIN_JSON), ("val", VAL_JSON)):
+    files = SPLIT_FILES if "split_ratios" in manifest else {"train": TRAIN_JSON, "val": VAL_JSON}
+    for split, filename in files.items():
         if (directory / f"{split}2017").resolve(strict=True) != root:
             raise ValueError(f"{split}2017 must point to the configured frame root")
         cache = directory / f"cache_{split}2017"
@@ -664,28 +699,40 @@ def preflight_dataset(directory, *, validation_token=None):
                           full_decode=manifest.get("full_decode", False))
         subsets.append(data)
     classes = [c["name"] for c in sorted(subsets[0]["categories"], key=lambda c: c["id"])]
-    if (subsets[0]["categories"] != subsets[1]["categories"]
+    if (any(subset["categories"] != subsets[0]["categories"] for subset in subsets[1:])
             or len(classes) != manifest["num_classes"]
             or json.loads((directory / "classes.json").read_text(encoding="utf-8")) != classes):
         raise ValueError("Prepared class metadata is inconsistent")
-    rides = [{PurePosixPath(image["file_name"]).parts[0] for image in subset["images"]}
-             for subset in subsets]
-    if rides[0] & rides[1]:
-        raise ValueError("Train/val rides overlap")
-    print(f"Preflight passed: num_classes={len(classes)}, "
-          f"train={len(subsets[0]['images'])}, val={len(subsets[1]['images'])}", flush=True)
+    names = [image["file_name"] for subset in subsets for image in subset["images"]]
+    ids = [image["id"] for subset in subsets for image in subset["images"]]
+    if len(set(names)) != len(names) or len(set(ids)) != len(ids):
+        raise ValueError("Train/val/test images overlap")
+    if "split_ratios" in manifest:
+        counts = {split: len(subset["images"]) for split, subset in zip(files, subsets)}
+        if counts != manifest["split_counts"] or not all(counts.values()):
+            raise ValueError("Prepared split counts are inconsistent or empty")
+    else:
+        rides = [{PurePosixPath(image["file_name"]).parts[0] for image in subset["images"]}
+                 for subset in subsets]
+        if rides[0] & rides[1]:
+            raise ValueError("Train/val rides overlap")
+    print(f"Preflight passed: num_classes={len(classes)}, " + ", ".join(
+        f"{split}={len(subset['images'])}" for split, subset in zip(files, subsets)), flush=True)
     return manifest
 
 
-def configure_training(exp, directory, *, cache=None):
+def configure_training(exp, directory, *, cache=None, evaluation_split="val"):
     manifest = preflight_dataset(directory, validation_token=os.environ.pop("YOLOX_CVAT_VALIDATION", None))
+    if evaluation_split not in {"val", "test"}:
+        raise ValueError("evaluation_split must be val or test")
+    if evaluation_split == "test" and "split_ratios" not in manifest:
+        raise ValueError("This legacy prepared dataset has no held-out test split; prepare it again")
     if cache == "disk":
-        images = []
-        for filename in (TRAIN_JSON, VAL_JSON):
-            images.extend(json.loads((Path(directory) / "annotations" / filename).read_text())["images"])
-        check_cache_space({"images": images}, directory, exp.input_size, exp.test_size,
-                          manifest["val_fraction"], manifest["seed"])
+        splits = {split: json.loads((Path(directory) / "annotations" / filename).read_text())["images"]
+                  for split, filename in (("train", TRAIN_JSON), ("val", VAL_JSON))}
+        check_cache_space(splits, directory, exp.input_size, exp.test_size)
     exp.data_dir = str(Path(directory).resolve())
     exp.train_ann = TRAIN_JSON
-    exp.val_ann = VAL_JSON
+    exp.val_ann = SPLIT_FILES[evaluation_split]
+    exp.test_ann = TEST_JSON
     exp.num_classes = manifest["num_classes"]

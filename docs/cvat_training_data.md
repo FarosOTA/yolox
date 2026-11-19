@@ -2,7 +2,8 @@
 
 This fork adds a Linux workflow that exports **COCO 1.0 annotations without
 images** using the optional `cvat-sdk` extra, reads only the exported filenames
-over read-only NFSv4, splits by ride, and supervises normal-user training.
+over read-only NFSv4, splits images 70% train / 15% validation / 15% held-out test,
+and supervises normal-user training.
 It can own a temporary mount or reuse an existing mount. It never configures
 the server, copies the frame tree locally, or modifies source images.
 
@@ -60,9 +61,9 @@ such as `datasets/cvat-runs` and `weights/yolox_nano.pth`, without `../../`.
 
 | Table | Settings |
 | --- | --- |
-| `cvat` | Required HTTPS `host` and non-empty `task_ids` array of unique positive integers. The template's IDs are fixtures; replace them with your tasks. Only selected tasks are exported and combined, then split by ride into train/validation; there is no separate test split. Legacy positive integer `project_id` is an alternative, never combined with `task_ids`. Keep the hostname for TLS; no credentials, path or query in the URL. |
+| `cvat` | Required HTTPS `host` and non-empty `task_ids` array of unique positive integers. The template's IDs are fixtures; replace them with your tasks. Only selected tasks are exported and combined, then split 70/15/15 by image count. Legacy positive integer `project_id` is an alternative, never combined with `task_ids`. Keep the hostname for TLS; no credentials, path or query in the URL. |
 | `nfs` | Required LAN IPv4 `server`; `export` defaults to `/`; `options` defaults to `["ro", "vers=4.2", "proto=tcp"]`. These three options are mandatory; only `nosuid`, `nodev`, `noexec`, `hard` may be added. Optional `frame_root` reuses an existing mount and never mounts/unmounts it. |
-| `dataset` | Local `output_dir` base (default `datasets/cvat-runs`), `val_fraction` (default 0.2), integer `seed` (default 0), `validation_workers` (16, allowed 1–128), `full_decode` (false). Each invocation creates a unique UTC timestamp/UUID run folder. |
+| `dataset` | Local `output_dir` base (default `datasets/cvat-runs`), integer split `seed` (default 0), `validation_workers` (16, allowed 1–128), `full_decode` (false). The image split is fixed at 70/15/15; the old `val_fraction` setting is rejected. Each invocation creates a unique UTC timestamp/UUID run folder. |
 | `training` | `model` (default `yolox-nano`) **or** `exp_file`, `devices` (1), `batch` (8), `fp16` (false), `cache` (`disk`, `ram` or `none`), optional `checkpoint` for fine-tuning. There is no `resume` setting. |
 | `training.overrides` | Experiment settings such as `max_epoch = 100`, `input_size = [640, 640]` and `data_num_workers = 4`. The example omits overrides, keeping the selected experiment's defaults (300 epochs for Nano). Dataset paths, class count and output directory are managed by the workflow, not overridable here. |
 | `classes.exclude` | Optional array of original CVAT labels to remove (default empty). Images remain, but their excluded boxes become unlabelled/background. |
@@ -113,8 +114,8 @@ excluded. An untouched label's index can shift when preceding labels merge
 or are excluded.
 
 With merging or exclusions enabled, surviving categories are renumbered 1–N
-and every retained annotation's `category_id` is rewritten in **both** train
-and validation JSON. Without either, sorted original category ids are retained.
+and every retained annotation's `category_id` is rewritten in **all three** train,
+validation and test JSON files. Without either, sorted original category ids are retained.
 `classes.json`, reported
 `num_classes`, loaders and per-class AP all use the final names/indices.
 Every box of retained labels is preserved. The final source-to-class mapping
@@ -281,7 +282,7 @@ for that wait), then reports download progress and total export time.
 
 The supervisor prints a summary on completion, failure or handled interruption.
 It includes model/checkpoint/cache settings and resolved epochs, dimensions and
-worker counts; source frame/box/class counts; retained/excluded boxes; and train/val
+worker counts; source frame/box/class counts; retained/excluded boxes; and train/val/test
 frames, empty frames, rides and per-class box counts. Phase durations and percentages
 are **exclusive wall times**, not overlapping parent/child timers: local/LAN
 preflight, export/download, annotation parsing, experiment/cache capacity, optional
@@ -316,18 +317,34 @@ errors are printed with the total count. Repair bad images or deliberately
 exclude them in CVAT; nothing is silently skipped.
 
 COCO subsets are combined with image/annotation ids remapped. Duplicate
-filenames/ids, inconsistent categories and unknown references fail. A seeded
-shuffle of sorted ride directories selects `ceil(rides × val_fraction)`
-validation rides, clamped to leave at least one per split. At least two rides
-are required. This is **not** a frame-level fraction; neighbouring frames
-stay together to avoid leakage. Unannotated exported images remain included.
+filenames/ids, inconsistent categories and unknown references fail. Every new
+dataset uses **70% train / 15% validation / 15% test by image count**, regardless
+of task count or sizes. Whole-image counts use largest-remainder rounding:
+floor each target, then assign leftover images to the largest fractional parts
+(ties use train, validation, test order). Every bucket receives at least one
+image; for tiny datasets this takes images from training if needed.
+At least three images are required, even if
+there is only one task/ride. For 2,539 images the counts are 1,777 / 381 / 381.
+
+Images are sorted by ride-relative filename. Each ride is apportioned against
+the remaining global split quotas using largest remainders, then divided into
+at most three contiguous filename segments. `dataset.seed` determines their
+train/val/test order. Export ordering does not affect membership. Timestamp-prefixed
+filenames preserve temporal order; arbitrary filenames may not. No images are
+dropped or shared between buckets, including unannotated images. This is **not
+ride-disjoint or class-stratified**: segments from a ride may appear in every
+bucket, and similar frames can cross segment boundaries. It reduces mixing
+compared with random per-frame shuffling but does not guarantee independence.
+Training updates weights from train and selects checkpoints using validation;
+test is never used in the training loop or its cache budget. Keep test evaluation
+for the final selected checkpoint, not iterative tuning.
 
 Each unique run folder contains:
 
-- `annotations/instances_train2017.json` and `instances_val2017.json`;
-- `train2017` and `val2017` symlinks to the same frame root, with distinct JSON selections;
+- `annotations/instances_train2017.json`, `instances_val2017.json` and `instances_test2017.json`;
+- `train2017`, `val2017` and `test2017` symlinks to the same frame root, with disjoint image selections;
 - `classes.json` in model index order and `class_mapping.json` with each source id/name, target name/id/index;
-- `prepared.json` with server/task IDs (or legacy project ID), NFS, split and class metadata;
+- `prepared.json` with server/task IDs (or legacy project ID), NFS, split ratios/method/counts/seed, rides and class metadata;
 - `resolved_config.json` with validated defaults, resolved paths, grouped merges and generated training arguments (no PAT or raw config comments);
 - `summary.json` after supervised cleanup, with the run outcome, phase durations, frame statistics, dataset counts and cleanup result; failures before a run directory is created print only a terminal summary;
 - transient `validation.json` for the one-use supervisor-to-launcher handoff (a random handoff identifier, **not** a CVAT PAT; consumed by the launcher);
@@ -341,7 +358,7 @@ check, not a snapshot.
 
 For disk caching, the supervisor exports annotations **before mounting** and
 estimates resized uint8 HWC array bytes using each listed image's dimensions,
-the ride split and resolved experiment `input_size`/`test_size`. It includes
+the train/validation image selections and resolved experiment `input_size`/`test_size`. It includes
 128 bytes per NPY header and 10% headroom, compares with free space on the
 local output filesystem, and fails before mounting/training if insufficient.
 The standard experiment currently caches only training images: the reported
@@ -368,11 +385,28 @@ uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 \
   --prepared-data datasets/prepared-cvat --cache disk
 ```
 
-Replace documentation placeholders. `--prepared-data` configures both dataset
-splits and class count after experiment overrides, and reruns preflight before
+Replace documentation placeholders. `--prepared-data` configures training/validation
+and class count after experiment overrides, and reruns preflight on all three splits before
 cache/CUDA/distributed launch. Use it on resume and every training node.
 Without it, existing training behavior is unchanged. Checkpoints are not
 downloaded automatically.
+
+After selecting the final checkpoint, evaluate the labeled held-out test set
+with the same model/experiment and input-size overrides used for training:
+
+```sh
+uv run --no-sync python tools/eval.py -n yolox-nano -d 1 -b 8 \
+  --prepared-data datasets/prepared-cvat --split test \
+  -c path/to/best_ckpt.pth
+```
+
+The default `--split val` uses validation. Do not combine prepared data with
+`--test`: that upstream flag means unlabeled COCO test-dev, not this labeled
+test set. The CVAT path retains normal COCO AP/AR computation. It requires a
+readable existing NFS mount; a supervisor-owned temporary mount has already
+been unmounted at run completion. Reuse/mount the recorded frame root before
+standalone evaluation. Existing two-way prepared datasets remain readable,
+but must be prepared again to obtain the new 70/15/15 split and test set.
 
 To resume interrupted training on persistent prepared data, keep the same
 experiment settings, classes, source data and split, and pass the checkpoint

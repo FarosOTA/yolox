@@ -28,6 +28,9 @@ def make_parser():
     parser = argparse.ArgumentParser("YOLOX Eval")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
+    parser.add_argument("--prepared-data", help="Local CVAT prepared directory; rerun data preflight")
+    parser.add_argument("--split", choices=("val", "test"), default="val",
+                        help="Labeled prepared-data split (default: val); test stays held out during training")
 
     # distributed
     parser.add_argument(
@@ -198,9 +201,18 @@ def main(exp, args, num_gpu):
 
 if __name__ == "__main__":
     configure_module()
-    args = make_parser().parse_args()
+    parser = make_parser()
+    args = parser.parse_args()
+    if args.split != "val" and not args.prepared_data:
+        parser.error("--split test requires --prepared-data")
+    if args.prepared_data and args.test:
+        parser.error("Use --split test for labeled CVAT evaluation, not the COCO test-dev --test flag")
     exp = get_exp(args.exp_file, args.name)
     exp.merge(args.opts)
+    if args.prepared_data:
+        from yolox.data.cvat import configure_training
+
+        configure_training(exp, args.prepared_data, evaluation_split=args.split)
 
     if not args.experiment_name:
         args.experiment_name = exp.exp_name

@@ -309,7 +309,7 @@ def install_export(monkeypatch, data, *, tasks=None):
 def test_prepare_preflight_and_real_training_loaders(lan, synthetic, tmp_path, monkeypatch, capsys):
     install_export(monkeypatch, synthetic)
     output = tmp_path / "prepared"
-    manifest = cvat.prepare_dataset(HOST, 42, lan.root, output, val_fraction=0.3, seed=13,
+    manifest = cvat.prepare_dataset(HOST, 42, lan.root, output, seed=13,
                                     nfs_server="192.0.2.10")
     assert manifest["num_classes"] == 2
     assert manifest["val_rides"] == ["20260101_090000"]
@@ -320,11 +320,18 @@ def test_prepare_preflight_and_real_training_loaders(lan, synthetic, tmp_path, m
     assert exp.num_classes == 2 and exp.data_dir == str(output)
     train = exp.get_dataset(cache=True, cache_type="disk")
     val = exp.get_eval_dataset()
-    assert len(train) == len(val) == 2
+    assert len(train) == 2 and len(val) == 1
+    assert manifest["split_counts"] == {"train": 2, "val": 1, "test": 1}
+    assert {image["file_name"] for image in train.coco.dataset["images"]}.isdisjoint(
+        image["file_name"] for image in val.coco.dataset["images"])
     assert train.class_ids == val.class_ids == [2, 9]
     assert train.pull_item(0)[1][0, 4] == 1  # category 9 is index 1, not export order 0.
-    assert val.load_image(0).shape[:2] == (13, 21)
-    assert train.read_img(0).shape[:2] == (20, 32)  # 15 × (32/23), floored by YOLOX.
+    assert val.load_image(0).shape[:2] == (14, 22)
+    assert train.read_img(0).shape[:2] == (19, 32)  # 13 × (32/21), floored by YOLOX.
+    cvat.configure_training(exp, output, evaluation_split="test")
+    test = exp.get_eval_dataset()
+    assert len(test) == 1 and test.load_image(0).shape[:2] == (16, 24)
+    assert test.coco.dataset["images"][0]["file_name"] == synthetic["images"][3]["file_name"]
     assert list((output / "cache_train2017").rglob("*.npy"))
     assert not list(lan.root.rglob("*.npy"))
     assert len(list(lan.root.rglob("*.jpg"))) == 5
@@ -342,6 +349,63 @@ def test_cache_symlink_rejected(lan, synthetic, tmp_path, monkeypatch):
     cvat.prepare_dataset(HOST, 42, lan.root, output, nfs_server="192.0.2.10")
     (output / "cache_train2017").symlink_to(lan.root, target_is_directory=True)
     with pytest.raises(ValueError, match="Cache must not contain symlinks"):
+        cvat.preflight_dataset(output)
+
+
+@pytest.mark.parametrize("ride_sizes,expected", [
+    ([3], {"train": 1, "val": 1, "test": 1}),
+    ([10], {"train": 7, "val": 2, "test": 1}),
+    ([20], {"train": 14, "val": 3, "test": 3}),
+    ([22, 58, 1150, 1309], {"train": 1777, "val": 381, "test": 381}),
+])
+def test_prepared_image_split_ratios_and_contiguous_segments(lan, synthetic, tmp_path,
+                                                            ride_sizes, expected):
+    source = {"images": [], "annotations": [], "categories": synthetic["categories"]}
+    original = lan.root / synthetic["images"][0]["file_name"]
+    for ride, size in enumerate(ride_sizes):
+        folder = lan.root / f"ride-{ride}"
+        folder.mkdir()
+        for frame in range(size):
+            path = folder / f"{frame:06d}.jpg"
+            path.hardlink_to(original)
+            image_id = len(source["images"]) + 1
+            source["images"].append({"id": image_id, "file_name": path.relative_to(lan.root).as_posix(),
+                                      "width": 21, "height": 13})
+            source["annotations"].append({**synthetic["annotations"][0], "id": image_id,
+                                          "image_id": image_id})
+    source["images"].reverse()  # Export order must not change membership.
+    output = tmp_path / "split"
+    manifest = cvat.prepare_dataset(HOST, 42, lan.root, output, data=source,
+                                    nfs_server="192.0.2.10", seed=7)
+    assert manifest["split_counts"] == expected
+    assert manifest["split_ratios"] == {"train": 0.7, "val": 0.15, "test": 0.15}
+    subsets = {split: json.loads((output / "annotations" / filename).read_text())
+               for split, filename in cvat.SPLIT_FILES.items()}
+    names = []
+    for split, subset in subsets.items():
+        assert len(subset["images"]) == expected[split]
+        assert {a["image_id"] for a in subset["annotations"]} == {i["id"] for i in subset["images"]}
+        names.extend(image["file_name"] for image in subset["images"])
+        for ride in range(len(ride_sizes)):
+            frames = sorted(int(Path(image["file_name"]).stem) for image in subset["images"]
+                            if image["file_name"].startswith(f"ride-{ride}/"))
+            if frames:
+                assert frames == list(range(frames[0], frames[-1] + 1))
+    assert len(names) == len(set(names)) == sum(ride_sizes)
+    assert set(names) == {image["file_name"] for image in source["images"]}
+    reordered = cvat.split_dataset({"images": list(reversed(source["images"]))}, seed=7)
+    for split in subsets:
+        assert {image["file_name"] for image in reordered[split]} == {
+            image["file_name"] for image in subsets[split]["images"]}
+    assert cvat.preflight_dataset(output) == manifest
+
+
+def test_preflight_rejects_overlapping_test_images(lan, synthetic, tmp_path):
+    output = tmp_path / "overlap"
+    cvat.prepare_dataset(HOST, 42, lan.root, output, data=synthetic, nfs_server="192.0.2.10")
+    (output / "annotations" / cvat.TEST_JSON).write_text(
+        (output / "annotations" / cvat.VAL_JSON).read_text(), encoding="utf-8")
+    with pytest.raises(ValueError, match="images overlap"):
         cvat.preflight_dataset(output)
 
 
@@ -371,13 +435,13 @@ def test_prompt_used_when_environment_missing(lan, synthetic, tmp_path, monkeypa
                    for path in output.rglob("*.json"))
 
 
-def test_output_on_share_and_single_ride_rejected(lan, synthetic, tmp_path, monkeypatch):
+def test_output_on_share_and_too_few_images_rejected(lan, synthetic, tmp_path, monkeypatch):
     install_export(monkeypatch, synthetic)
     with pytest.raises(ValueError, match="local filesystem"):
         cvat.prepare_dataset(HOST, 42, lan.root, lan.root / "prepared", nfs_server="192.0.2.10")
     synthetic["images"] = synthetic["images"][:2]
     synthetic["annotations"] = synthetic["annotations"][:2]
-    with pytest.raises(ValueError, match="At least two rides"):
+    with pytest.raises(ValueError, match="At least three images"):
         cvat.prepare_dataset(HOST, 42, lan.root, tmp_path / "prepared", nfs_server="192.0.2.10")
     assert not (tmp_path / "prepared").exists()
 
@@ -535,6 +599,8 @@ def test_supervisor_never_unmounts_existing_root(lan, synthetic, monkeypatch, ru
     ('[training]\nmodel = "yolox-nano"\nexp_file = "exp.py"', "not both"),
     ('[training]\nresume = true', "Unknown keys in training: resume"),
     ('[training]\ncheckpoint = "weights.pth"\nresume = false', "Unknown keys in training: resume"),
+    ('[dataset]\nval_fraction = 0.2', "Unknown keys in dataset: val_fraction"),
+    ('[training.overrides]\ntest_ann = "custom.json"', "test_ann is managed"),
     ('[classes.merge]\nvehicle = []', "non-empty array"),
     ('[classes.merge]\nvehicle = "car"', "non-empty array"),
     ('[classes.merge]\nvehicle = ["car"]\nother = ["car"]', "'car'.*'vehicle'.*'other'"),
@@ -654,8 +720,10 @@ def grouped_export(synthetic):
 
 
 @pytest.mark.parametrize("exclude", [[], ["person", "cone"]])
+@pytest.mark.parametrize("evaluation_split", ["val", "test"])
 def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, run_config,
-                                                         monkeypatch, capsys, tmp_path, exclude):
+                                                         monkeypatch, capsys, tmp_path, exclude,
+                                                         evaluation_split):
     from tools import train_cvat
     from yolox.evaluators.coco_evaluator import COCOEvaluator
     import os
@@ -696,7 +764,7 @@ def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, r
         assert "test-pat-not-a-real-secret" not in (output / "resolved_config.json").read_text()
     exp = get_exp(exp_name="yolox-nano")
     exp.input_size = exp.test_size = (32, 32)
-    cvat.configure_training(exp, runs[0])
+    cvat.configure_training(exp, runs[0], evaluation_split=evaluation_split)
     assert exp.num_classes == len(expected_classes)
     train, val = exp.get_dataset(), exp.get_eval_dataset()
     assert train._classes == val._classes == tuple(expected_classes)
@@ -745,6 +813,8 @@ def test_exclusion_without_merges_keeps_empty_images(lan, synthetic, tmp_path, m
     cvat.configure_training(exp, output)
     assert exp.num_classes == 1
     datasets = [exp.get_dataset(), exp.get_eval_dataset()]
+    cvat.configure_training(exp, output, evaluation_split="test")
+    datasets.append(exp.get_eval_dataset())
     assert sum(len(dataset) for dataset in datasets) == 4
     assert sum(len(dataset.coco.dataset["annotations"]) for dataset in datasets) == 1
     for dataset in datasets:
@@ -896,9 +966,9 @@ def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_confi
     assert summary["source"]["boxes_per_class"] == {"car": 3, "person": 1}
     assert summary["dataset"]["retained_boxes"] == 3 and summary["dataset"]["excluded_boxes"] == 1
     assert summary["dataset"]["classes"] == ["car"]
-    for split, expected_boxes, expected_empty in [("train", 1, 1), ("val", 2, 0)]:
+    for split, frames, expected_boxes, expected_empty in [("train", 2, 2, 0), ("val", 1, 1, 0), ("test", 1, 0, 1)]:
         stats = summary["dataset"]["splits"][split]
-        assert (stats["frames"], stats["boxes"], stats["empty_frames"]) == (2, expected_boxes, expected_empty)
+        assert (stats["frames"], stats["boxes"], stats["empty_frames"]) == (frames, expected_boxes, expected_empty)
         assert stats["boxes_per_class"] == {"car": expected_boxes}
     stats = summary["validation"]
     assert stats["status"] == "complete" and stats["completed_frames"] == 4 and stats["invalid_frames"] == 0
@@ -913,14 +983,14 @@ def test_supervisor_validates_images_once(lan, synthetic, monkeypatch, run_confi
                    for path in Path(run_config["dataset"]["output_dir"]).rglob("*.json"))
 
 
-@pytest.mark.parametrize("change", ["json", "mount", "token"])
+@pytest.mark.parametrize("change", ["json", "test-json", "mount", "token"])
 def test_changed_validation_handoff_cannot_skip_images(lan, synthetic, monkeypatch, tmp_path, change):
     install_export(monkeypatch, synthetic)
     output = tmp_path / "prepared"
     cvat.prepare_dataset(HOST, 42, lan.root, output, nfs_server="192.0.2.10",
                          validation_token="test-handoff")
-    if change == "json":
-        path = output / "annotations" / cvat.TRAIN_JSON
+    if change in {"json", "test-json"}:
+        path = output / "annotations" / (cvat.TRAIN_JSON if change == "json" else cvat.TEST_JSON)
         data = json.loads(path.read_text())
         data["images"][0]["width"] += 1
         path.write_text(json.dumps(data))
@@ -936,17 +1006,18 @@ def test_changed_validation_handoff_cannot_skip_images(lan, synthetic, monkeypat
 
 
 def test_disk_cache_estimate_and_space_boundary(tmp_path, monkeypatch):
-    data = {"images": [
-        {"file_name": "a/frame.jpg", "width": 100, "height": 300},
-        {"file_name": "b/frame.jpg", "width": 400, "height": 200},
-    ]}
-    # Seed 0 leaves a as validation. Separate aspect ratios/target sizes catch H/W and split mistakes.
+    splits = {
+        "val": [{"file_name": "a/frame.jpg", "width": 100, "height": 300}],
+        "train": [{"file_name": "b/frame.jpg", "width": 400, "height": 200}],
+        "test": [{"file_name": "c/frame.jpg", "width": 10000, "height": 10000}],
+    }
+    # Asymmetric sizes catch H/W and split mistakes; held-out test must not reserve training cache.
     expected = 14802  # ceil(((20*60*3+128) + (80*40*3+128)) * 1.1)
     monkeypatch.setattr(cvat.shutil, "disk_usage", lambda path: SimpleNamespace(free=expected))
-    assert cvat.check_cache_space(data, tmp_path / "new", (100, 80), (60, 40), 0.5) == expected
+    assert cvat.check_cache_space(splits, tmp_path / "new", (100, 80), (60, 40)) == expected
     monkeypatch.setattr(cvat.shutil, "disk_usage", lambda path: SimpleNamespace(free=expected - 1))
     with pytest.raises(ValueError, match="Insufficient space.*available.*training.cache"):
-        cvat.check_cache_space(data, tmp_path / "new", (100, 80), (60, 40), 0.5)
+        cvat.check_cache_space(splits, tmp_path / "new", (100, 80), (60, 40))
 
 
 def test_space_failure_precedes_mount_and_training(tmp_path, monkeypatch, run_config, synthetic):

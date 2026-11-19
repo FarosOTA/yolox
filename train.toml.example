@@ -5,7 +5,7 @@
 [cvat]
 host = "https://cvat.example.com"
 # Fixture IDs only: replace with your actual CVAT task IDs.
-# Selected frames are split by ride into training and validation, not by task count.
+# Selected images are always split 70% train / 15% validation / 15% test.
 task_ids = [101, 102, 103, 104]
 
 [nfs]

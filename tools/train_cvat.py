@@ -20,7 +20,7 @@ import uuid
 from yolox.data.cvat import (
     RunReport,
     check_cache_space, check_local, check_network_hosts, class_merge_sources, cvat_hostname,
-    export_project, prepare_dataset, read_export,
+    export_project, prepare_dataset, read_export, split_dataset,
 )
 from yolox.exp import get_exp
 
@@ -33,7 +33,7 @@ def load_config(path):
     schema = {
         "cvat": {"host": (str,), "project_id": (int,), "task_ids": (list,)},
         "nfs": {"server": (str,), "export": (str,), "options": (list,), "frame_root": (str,)},
-        "dataset": {"output_dir": (str,), "val_fraction": (int, float), "seed": (int,),
+        "dataset": {"output_dir": (str,), "seed": (int,),
                     "validation_workers": (int,), "full_decode": (bool,)},
         "training": {"model": (str,), "exp_file": (str,), "devices": (int,), "batch": (int,),
                      "fp16": (bool,), "cache": (str,), "checkpoint": (str,),
@@ -43,7 +43,7 @@ def load_config(path):
     defaults = {
         "cvat": {},
         "nfs": {"export": "/", "options": ["ro", "vers=4.2", "proto=tcp"]},
-        "dataset": {"output_dir": "datasets/cvat-runs", "val_fraction": 0.2, "seed": 0,
+        "dataset": {"output_dir": "datasets/cvat-runs", "seed": 0,
                     "validation_workers": 16, "full_decode": False},
         "training": {"devices": 1, "batch": 8, "fp16": False, "cache": "disk",
                      "overrides": {}},
@@ -95,8 +95,6 @@ def load_config(path):
             or set(options) - allowed or len(options) != len(set(options))):
         raise ValueError("nfs.options requires ro, vers=4.2, proto=tcp; "
                          "only nosuid, nodev, noexec and hard may be added")
-    if not 0 < dataset["val_fraction"] < 1:
-        raise ValueError("dataset.val_fraction must be between 0 and 1")
     if not 1 <= dataset["validation_workers"] <= 128:
         raise ValueError("dataset.validation_workers must be between 1 and 128")
     if training["devices"] < 1 or training["batch"] < 1:
@@ -116,7 +114,7 @@ def load_config(path):
     for key, value in training["overrides"].items():
         if key not in vars(exp):
             raise ValueError(f"Unknown training.overrides key: {key}")
-        if key in {"data_dir", "train_ann", "val_ann", "num_classes", "output_dir"}:
+        if key in {"data_dir", "train_ann", "val_ann", "test_ann", "num_classes", "output_dir"}:
             raise ValueError(f"training.overrides.{key} is managed by the workflow")
         if type(value) not in (str, int, float, bool, list):
             raise ValueError(f"Unsupported training.overrides value for {key}")
@@ -265,12 +263,15 @@ def run_training(config):
             "max_epoch": exp.max_epoch, "input_size": exp.input_size,
             "test_size": exp.test_size, "data_num_workers": exp.data_num_workers,
             "validation_workers": dataset["validation_workers"], "full_decode": dataset["full_decode"],
-            "seed": dataset["seed"], "val_fraction": dataset["val_fraction"],
+            "seed": dataset["seed"], "split_ratios": {"train": 0.7, "val": 0.15, "test": 0.15},
         }
+        splits = split_dataset(data, dataset["seed"])
+        print("70/15/15 image split: " + ", ".join(
+            f"{split}={len(images)}" for split, images in splits.items()), flush=True)
         if training["cache"] == "disk":
             print("Checking disk cache capacity...", flush=True)
             report.data["cache_required_bytes"] = check_cache_space(
-                data, output, exp.input_size, exp.test_size, dataset["val_fraction"], dataset["seed"])
+                splits, output, exp.input_size, exp.test_size)
         validation_token = uuid.uuid4().hex
         root = nfs.get("frame_root")
         if root is None:
@@ -300,7 +301,7 @@ def run_training(config):
                     raise TrainingInterrupted(pending[0])
         print("Preparing dataset: checking mount, validating images and mapping classes...", flush=True)
         prepare_dataset(cvat["host"], cvat.get("project_id"), root, output,
-                        dataset["val_fraction"], dataset["seed"], merge=config["classes"]["merge"],
+                        seed=dataset["seed"], merge=config["classes"]["merge"],
                         exclude=config["classes"]["exclude"],
                         nfs_server=nfs["server"], nfs_export=nfs["export"], data=data,
                         workers=dataset["validation_workers"], full_decode=dataset["full_decode"],
