@@ -82,6 +82,9 @@ fine-tuning, pass the matching checkpoint, for example
 `-n yolox-nano -c weights/yolox_nano.pth`, without `--resume`.
 Existing files are not integrity-checked; see
 [model asset provenance](docs/model_assets.md) before loading weights.
+See the [weights guide](weights/README.md) for individual downloads and a
+smallest-to-largest comparison of checkpoint sizes, parameters, compute and
+COCO accuracy.
 
 Use the existing [Quick Start training instructions](#quick-start) with a CUDA environment.
 For example, resume the latest checkpoint in an experiment's output directory,
