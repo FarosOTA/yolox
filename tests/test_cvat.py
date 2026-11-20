@@ -337,10 +337,11 @@ def test_prepare_preflight_and_real_training_loaders(lan, synthetic, tmp_path, m
     assert len(list(lan.root.rglob("*.jpg"))) == 5
     assert cvat.preflight_dataset(output) == manifest
     assert "test-pat-not-a-real-secret" not in capsys.readouterr().out
-    # No silently stale acceptance: every training invocation checks the real frames again.
+    # Revalidation warns rather than aborting if a source frame has become unreadable.
     (lan.root / synthetic["images"][0]["file_name"]).write_bytes(b"")
-    with pytest.raises(ValueError, match="non-empty"):
-        cvat.configure_training(exp, output)
+    cvat.configure_training(exp, output)
+    from yolox.data.image_errors import image_errors
+    assert any("non-empty" in record["reason"] for record in image_errors(output))
 
 
 def test_cache_symlink_rejected(lan, synthetic, tmp_path, monkeypatch):
@@ -350,6 +351,130 @@ def test_cache_symlink_rejected(lan, synthetic, tmp_path, monkeypatch):
     (output / "cache_train2017").symlink_to(lan.root, target_is_directory=True)
     with pytest.raises(ValueError, match="Cache must not contain symlinks"):
         cvat.preflight_dataset(output)
+
+
+def test_preparation_skips_bad_frames_and_reports_at_run_end(lan, synthetic, tmp_path):
+    from loguru import logger
+    from yolox.data.image_errors import record_image_error
+
+    bad = synthetic["images"][0]
+    (lan.root / bad["file_name"]).unlink()
+    output = tmp_path / "prepared"
+    report = cvat.RunReport({})
+    report.data["source"] = {"frames": 4, "boxes": 4, "classes": 2,
+                              "boxes_per_class": {"car": 4, "person": 0}}
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)))
+    try:
+        manifest = cvat.prepare_dataset(HOST, 42, lan.root, output, data=synthetic,
+                                        nfs_server="192.0.2.10", report=report)
+        assert sum(manifest["split_counts"].values()) == 3
+        for filename in cvat.SPLIT_FILES.values():
+            data = json.loads((output / "annotations" / filename).read_text())
+            assert all(image["id"] != bad["id"] for image in data["images"])
+            assert all(a["image_id"] != bad["id"] for a in data["annotations"])
+        assert "End of image validation" in "".join(messages)
+        assert bad["file_name"] in "".join(messages)
+        # A diagnostic written by the trainer must survive into the supervisor summary.
+        record_image_error(output, {"split": "train2017", "image_id": 2,
+                                    "path": "ride/later.jpg", "reason": "OpenCV returned no pixels"})
+        report.data["cleanup"] = {}
+        messages.clear()
+        report.finish("completed", output)
+        summary = json.loads((output / "summary.json").read_text())
+        assert len(summary["skipped_frames"]) == 2
+        assert "End of training run" in "".join(messages)
+        assert bad["file_name"] in "".join(messages) and "ride/later.jpg" in "".join(messages)
+    finally:
+        logger.remove(sink)
+
+
+@pytest.mark.parametrize("cache", [None, "ram", "disk", "partial_disk"])
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "dimensions"])
+def test_unreadable_coco_frame_skips_with_matching_labels(lan, synthetic, tmp_path, cache, damage):
+    from torch.utils.data import DataLoader
+    from yolox.data import ValTransform
+    from yolox.data.datasets import COCODataset
+    from yolox.data.image_errors import image_errors
+
+    # Validation succeeds, then the source changes before cache construction/loading.
+    cvat.validate_coco(synthetic, lan.root)
+    output = tmp_path / "dataset"
+    (output / "annotations").mkdir(parents=True)
+    (output / "annotations" / cvat.TRAIN_JSON).write_text(json.dumps(synthetic))
+    (output / "train2017").symlink_to(lan.root, target_is_directory=True)
+    bad = synthetic["images"][0]
+    path = lan.root / bad["file_name"]
+    if damage == "missing":
+        path.unlink()
+    elif damage == "corrupt":
+        path.write_bytes(b"not an image")
+    else:
+        assert cv2.imwrite(str(path), np.zeros((7, 9, 3), np.uint8))
+    if cache == "partial_disk":
+        (output / "cache_train2017").mkdir()
+    dataset = COCODataset(str(output), img_size=(32, 32), preproc=ValTransform(),
+                          cache=cache is not None, cache_type="disk" if cache == "partial_disk" else cache)
+    # Real worker processes exercise error propagation and persistent diagnostics.
+    batches = list(DataLoader(dataset, batch_size=2, num_workers=2))
+    assert [int(i) for batch in batches for i in batch[3]] == [2, 2, 3, 4]
+    pixels, labels, dimensions, ids = dataset.pull_item(0)
+    assert ids.tolist() == [2] and dimensions == (14, 22)
+    assert np.all(pixels == 2)
+    np.testing.assert_allclose(labels[0], [2 * 32 / 22, 3 * 32 / 22, 7 * 32 / 22, 7 * 32 / 22, 1])
+    records = image_errors(output)
+    assert len(records) == 1 and records[0]["image_id"] == 1
+    assert records[0]["path"] == str(output / "train2017" / bad["file_name"])
+    # Complete source loss must terminate instead of retrying forever.
+    for image in synthetic["images"]:
+        (lan.root / image["file_name"]).unlink(missing_ok=True)
+    uncached = COCODataset(str(output), img_size=(32, 32))
+    with pytest.raises(RuntimeError, match="No readable frames"):
+        uncached.pull_item(0)
+
+
+def test_coco_metrics_exclude_skips_but_include_readable_misses(lan, synthetic, tmp_path, monkeypatch):
+    from loguru import logger
+    import torch
+    from torch.utils.data import DataLoader
+    from yolox.data import ValTransform
+    from yolox.data.datasets import COCODataset
+    from yolox.evaluators.coco_evaluator import COCOEvaluator
+
+    output = tmp_path / "dataset"
+    (output / "annotations").mkdir(parents=True)
+    (output / "annotations" / cvat.TRAIN_JSON).write_text(json.dumps(synthetic))
+    (output / "train2017").symlink_to(lan.root, target_is_directory=True)
+    (lan.root / synthetic["images"][0]["file_name"]).unlink()
+    dataset = COCODataset(str(output), img_size=(32, 32), preproc=ValTransform())
+    evaluator = COCOEvaluator(DataLoader(dataset, batch_size=2), (32, 32), 0.01, 0.65, 2)
+    monkeypatch.setattr("yolox.evaluators.coco_evaluator.tempfile.tempdir", str(tmp_path))
+    # Run the real evaluation loop/NMS/COCO metrics with CPU fixture predictions;
+    # this is not a CUDA hardware test.
+    monkeypatch.setattr(torch.cuda, "FloatTensor", torch.FloatTensor)
+    monkeypatch.setattr("yolox.evaluators.coco_evaluator.time_synchronized", cvat.time.time)
+
+    class FixtureDetector(torch.nn.Module):
+        def forward(self, images):
+            ids = images[:, 0, 0, 0]
+            result = torch.zeros((len(images), 2, 7))
+            result[:, 0, :4] = torch.tensor([4.5, 5, 5, 4]) * (32 / (20 + ids[:, None]))
+            result[:, 0, 4] = (ids < 4).float()
+            result[:, 0, 6] = 1
+            return result
+
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)))
+    try:
+        (ap, _, _), predictions = evaluator.evaluate(FixtureDetector(), return_outputs=True)
+    finally:
+        logger.remove(sink)
+    # 2/3 recall: 67 of COCO's 101 recall thresholds. Frame 1 was skipped;
+    # frame 4 was read successfully but missed, and must still reduce AP.
+    assert ap == pytest.approx(67 / 101)
+    assert set(predictions) == {2, 3, 4} and predictions[4]["bboxes"] == []
+    assert "End of validation" in "".join(messages)
+    assert synthetic["images"][0]["file_name"] in "".join(messages)
 
 
 @pytest.mark.parametrize("ride_sizes,expected", [
@@ -1001,8 +1126,11 @@ def test_changed_validation_handoff_cannot_skip_images(lan, synthetic, monkeypat
         if change == "mount":
             original = cvat.mount_info
             monkeypatch.setattr(cvat, "mount_info", lambda path: {**original(path), "id": 999})
-    with pytest.raises(ValueError, match=message):
+    context = pytest.raises(ValueError, match="No readable frames") if change == "test-json" else nullcontext()
+    with context:
         cvat.preflight_dataset(output, validation_token="wrong" if change == "token" else "test-handoff")
+    from yolox.data.image_errors import image_errors
+    assert any(message in record["reason"] for record in image_errors(output))
 
 
 def test_disk_cache_estimate_and_space_boundary(tmp_path, monkeypatch):

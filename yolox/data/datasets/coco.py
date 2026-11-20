@@ -9,6 +9,7 @@ import numpy as np
 from pycocotools.coco import COCO
 
 from ..dataloading import get_yolox_datadir
+from ..image_errors import ImageReadError, record_image_error
 from .datasets_wrapper import CacheDataset, cache_read_img
 
 
@@ -71,6 +72,7 @@ class COCODataset(CacheDataset):
         self.img_size = img_size
         self.preproc = preproc
         self.annotations = self._load_coco_annotations()
+        self.unreadable = set()
 
         path_filename = [os.path.join(name, anno[3]) for anno in self.annotations]
         super().__init__(
@@ -145,8 +147,22 @@ class COCODataset(CacheDataset):
 
         img_file = os.path.join(self.data_dir, self.name, file_name)
 
-        img = cv2.imread(img_file)
-        assert img is not None, f"file named {img_file} not found"
+        if index in self.unreadable:
+            raise ImageReadError(f"Previously unreadable frame: {img_file}")
+        try:
+            img = cv2.imread(img_file)
+            if img is None:
+                raise ImageReadError("OpenCV returned no pixels: missing, unreadable or corrupt image")
+            expected = self.annotations[index][1]
+            if img.shape[:2] != expected:
+                raise ImageReadError(f"dimension mismatch: COCO HxW {expected}, image {img.shape[:2]}")
+        except (OSError, cv2.error) as error:
+            self.unreadable.add(index)
+            record_image_error(self.data_dir, {
+                "split": self.name, "image_id": self.ids[index],
+                "path": img_file, "reason": str(error),
+            })
+            raise ImageReadError(f"{img_file}: {error}") from error
 
         return img
 
@@ -155,11 +171,17 @@ class COCODataset(CacheDataset):
         return self.load_resized_img(index)
 
     def pull_item(self, index):
-        id_ = self.ids[index]
-        label, origin_image_size, _, _ = self.annotations[index]
-        img = self.read_img(index)
-
-        return img, copy.deepcopy(label), origin_image_size, np.array([id_])
+        # Keep batch sizes stable for mosaic and DDP, but never pair replacement
+        # pixels with the failed frame's annotations or evaluation identity.
+        for offset in range(self.num_imgs):
+            candidate = (index + offset) % self.num_imgs
+            try:
+                img = self.read_img(candidate)
+            except ImageReadError:
+                continue
+            label, origin_image_size, _, _ = self.annotations[candidate]
+            return img, copy.deepcopy(label), origin_image_size, np.array([self.ids[candidate]])
+        raise RuntimeError(f"No readable frames remain in {self.name}")
 
     @CacheDataset.mosaic_getitem
     def __getitem__(self, index):

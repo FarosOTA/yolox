@@ -206,8 +206,8 @@ JSONs and class/provenance metadata to the frame root, filesystem device/inode,
 mount ID/options/source and mount namespace. It is not a reusable validation
 cache: a missing/changed record, JSON or mount triggers image checks again.
 Standalone `--prepared-data` invocations without the supervisor handoff always
-check images. Nothing detects source-file mutation after validation; keep the
-share immutable throughout a run.
+check images. Runtime COCO reads also detect decode failures and dimension changes,
+but not arbitrary content changes; keep the share immutable throughout a run.
 
 On normal completion, exceptions, failed preflight, Ctrl-C or SIGTERM, the
 supervisor terminates the training process group and waits/reaps DataLoader
@@ -309,12 +309,33 @@ Header reads use an explicit 8 KiB Python buffer rather than the filesystem's de
 (which can be much larger on NFS). This is a buffer size, not a header-size
 limit: JPEGs with large APP/EXIF segments can read additional buffers. It does
 not control kernel/NFS readahead. Opt-in full decoding keeps normal buffering.
-No pixels are decoded in the default mode. Invalid/truncated headers, dimension
-mismatches, path traversal and escaping symlinks fail. Header checks cannot
-detect corruption in pixel payloads; set `dataset.full_decode = true` for
-slower full decoding, still in parallel and once per supervised run. Up to 20 image
-errors are printed with the total count. Repair bad images or deliberately
-exclude them in CVAT; nothing is silently skipped.
+No pixels are decoded in the default mode. Header checks cannot detect corruption
+in pixel payloads; set `dataset.full_decode = true` for slower full decoding,
+still in parallel and once per supervised run. Preparation skips missing, empty,
+unreadable or invalid images (including dimension mismatches) and removes their
+annotations before splitting. Unsafe paths, escaping symlinks and malformed COCO
+metadata remain fatal. Too few usable images to populate all splits also fail.
+
+COCO cache construction and loading tolerate frames that become unreadable after
+validation, including OpenCV returning no pixels. Cache estimation/building skips
+only source-image read failures; cache write failures and unrelated errors still
+propagate. Missing entries in an interrupted disk cache fall back to source reads.
+At runtime, the loader skips a failed frame and uses the next readable frame **with
+its own labels, dimensions and image ID**, keeping batch sizes stable for mosaic
+and distributed training. It stops with an error if no readable frames remain.
+Model evaluation deduplicates replacement IDs and evaluates only successfully read
+images, including readable images with zero detections. Prepared JSON and split
+counts describe preparation, not the runtime replacement frequency.
+
+Verbose warnings at the end of image validation, model validation and training list
+every recorded path, image ID, split and failure reason without a 20-entry truncation.
+Atomic, deduplicated JSON records in the local dataset's `skipped_frames/` directory
+survive loader processes and trainer failures; the supervisor includes them in
+`summary.json` and repeats them after worker/mount cleanup. Records accumulate for
+the prepared directory, including when reusing it for another invocation; they are
+diagnostics, not a permanent blacklist of repaired files. A loader instance remembers
+failed source frames until it is recreated. Repair the listed files or investigate
+NFS health; skipping a frame does not repair its source.
 
 COCO subsets are combined with image/annotation ids remapped. Duplicate
 filenames/ids, inconsistent categories and unknown references fail. Every new

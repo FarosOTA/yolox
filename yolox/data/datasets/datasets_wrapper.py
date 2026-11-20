@@ -7,7 +7,7 @@ import copy
 import os
 import random
 from abc import ABCMeta, abstractmethod
-from functools import partial, wraps
+from functools import wraps
 from multiprocessing.pool import ThreadPool
 import psutil
 from loguru import logger
@@ -17,6 +17,8 @@ import numpy as np
 
 from torch.utils.data.dataset import ConcatDataset as torchConcatDataset
 from torch.utils.data.dataset import Dataset as torchDataset
+
+from ..image_errors import ImageReadError
 
 
 class ConcatDataset(torchConcatDataset):
@@ -239,31 +241,39 @@ class CacheDataset(Dataset, metaclass=ABCMeta):
 
             num_threads = min(8, max(1, os.cpu_count() - 1))
             b = 0
-            load_imgs = ThreadPool(num_threads).imap(
-                partial(self.read_img, use_cache=False),
-                range(num_imgs)
-            )
-            pbar = tqdm(enumerate(load_imgs), total=num_imgs)
-            for i, x in pbar:   # x = self.read_img(self, i, use_cache=False)
-                if self.cache_type == 'ram':
-                    self.imgs[i] = x
-                else:   # 'disk'
-                    cache_filename = f'{self.path_filename[i].split(".")[0]}.npy'
-                    cache_path_filename = os.path.join(self.cache_dir, cache_filename)
-                    os.makedirs(os.path.dirname(cache_path_filename), exist_ok=True)
-                    np.save(cache_path_filename, x)
-                b += x.nbytes
-                pbar.desc = \
-                    f'Caching images ({b / gb:.1f}/{mem_required / gb:.1f}GB {self.cache_type})'
-            pbar.close()
+            with ThreadPool(num_threads) as pool:
+                load_imgs = pool.imap(self._read_cache_source, range(num_imgs))
+                with tqdm(enumerate(load_imgs), total=num_imgs) as pbar:
+                    for i, x in pbar:
+                        if x is None:
+                            continue
+                        if self.cache_type == 'ram':
+                            self.imgs[i] = x
+                        else:   # 'disk'
+                            cache_filename = f'{self.path_filename[i].split(".")[0]}.npy'
+                            cache_path_filename = os.path.join(self.cache_dir, cache_filename)
+                            os.makedirs(os.path.dirname(cache_path_filename), exist_ok=True)
+                            np.save(cache_path_filename, x)
+                        b += x.nbytes
+                        pbar.desc = \
+                            f'Caching images ({b / gb:.1f}/{mem_required / gb:.1f}GB {self.cache_type})'
+
+    def _read_cache_source(self, index):
+        try:
+            return self.read_img(index, use_cache=False)
+        except ImageReadError:
+            return None
 
     def cal_cache_occupy(self, num_imgs):
         cache_bytes = 0
+        readable_samples = 0
         num_samples = min(num_imgs, 32)
         for _ in range(num_samples):
-            img = self.read_img(index=random.randint(0, num_imgs - 1), use_cache=False)
-            cache_bytes += img.nbytes
-        mem_required = cache_bytes * num_imgs / num_samples
+            img = self._read_cache_source(random.randint(0, num_imgs - 1))
+            if img is not None:
+                cache_bytes += img.nbytes
+                readable_samples += 1
+        mem_required = cache_bytes * num_imgs / max(readable_samples, 1)
         return mem_required
 
 
@@ -284,11 +294,18 @@ def cache_read_img(use_cache=True):
             if cache:
                 if self.cache_type == "ram":
                     img = self.imgs[index]
+                    if img is None:
+                        return read_img_fn(self, index)
                     img = copy.deepcopy(img)
                 elif self.cache_type == "disk":
-                    img = np.load(
-                        os.path.join(
-                            self.cache_dir, f"{self.path_filename[index].split('.')[0]}.npy"))
+                    try:
+                        img = np.load(
+                            os.path.join(
+                                self.cache_dir, f"{self.path_filename[index].split('.')[0]}.npy"))
+                    except FileNotFoundError:
+                        # Interrupted caches and intentionally skipped source frames
+                        # leave holes; a directory alone is not a complete cache.
+                        img = read_img_fn(self, index)
                 else:
                     raise ValueError(f"Unknown cache type: {self.cache_type}")
             else:

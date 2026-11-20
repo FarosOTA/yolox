@@ -10,7 +10,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-from yolox.data import DataPrefetcher
+from yolox.data import DataPrefetcher, get_yolox_datadir
+from yolox.data.image_errors import image_errors, warn_image_errors
 from yolox.exp import Exp
 from yolox.utils import (
     MeterBuffer,
@@ -208,6 +209,8 @@ class Trainer:
             "Training of experiment is done and the best AP is {:.2f}".format(self.best_ap * 100)
         )
         if self.rank == 0:
+            directory = self.exp.data_dir or os.path.join(get_yolox_datadir(), "COCO")
+            warn_image_errors(image_errors(directory), "End of training run")
             if self.args.logger == "wandb":
                 self.wandb_logger.finish()
             elif self.args.logger == "mlflow":

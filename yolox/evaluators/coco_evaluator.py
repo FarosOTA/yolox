@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from yolox.data.datasets import COCO_CLASSES
+from yolox.data.image_errors import image_errors, warn_image_errors
 from yolox.utils import (
     gather,
     is_main_process,
@@ -200,7 +201,9 @@ class COCOEvaluator:
             torch.distributed.reduce(statistics, dst=0)
 
         data_list = list(itertools.chain.from_iterable(data_by_image.values()))
-        eval_results = self.evaluate_prediction(data_list, statistics)
+        eval_results = self.evaluate_prediction(data_list, statistics, image_ids=list(data_by_image))
+        if is_main_process():
+            warn_image_errors(image_errors(self.dataloader.dataset.data_dir), "End of validation")
         synchronize()
 
         if return_outputs:
@@ -213,6 +216,9 @@ class COCOEvaluator:
         for (output, img_h, img_w, img_id) in zip(
             outputs, info_imgs[0], info_imgs[1], ids
         ):
+            if int(img_id) in image_wise_data:
+                # A skipped frame can select another frame in this same batch.
+                continue
             image_wise_data[int(img_id)] = {"bboxes": [], "scores": [], "categories": []}
             if output is None:
                 continue
@@ -256,7 +262,7 @@ class COCOEvaluator:
             return data_list, image_wise_data
         return data_list
 
-    def evaluate_prediction(self, data_dict, statistics):
+    def evaluate_prediction(self, data_dict, statistics, image_ids=None):
         if not is_main_process():
             return 0, 0, None
 
@@ -302,6 +308,10 @@ class COCOEvaluator:
                 logger.warning("Use standard COCOeval.")
 
             cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
+            if image_ids is not None:
+                # Includes successfully read frames with no detections, but not
+                # unreadable frames replaced by the loader. Duplicates count once.
+                cocoEval.params.imgIds = sorted(set(image_ids))
             cocoEval.evaluate()
             cocoEval.accumulate()
             redirect_string = io.StringIO()

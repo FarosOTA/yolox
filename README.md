@@ -201,7 +201,16 @@ images, throughput, ETA and detected error count. An end-of-run summary reports
 success/failure/interruption, exclusive phase timings, total elapsed time including
 cleanup, source/final class and split counts, and per-frame validation statistics.
 It is saved as `summary.json` when the run directory exists; see the guide for
-timing definitions and partial-run limitations. The supervisor temporarily mounts
+timing definitions and partial-run limitations.
+
+Unreadable frames are skipped rather than aborting preparation or COCO cache/loading.
+Verbose warnings at the end of image validation, model validation and the training
+run list paths, image IDs and reasons; durable `skipped_frames/` records also feed
+`summary.json`. Runtime replacements retain their own labels/IDs, and evaluation
+counts each successfully read image once. Empty usable datasets and unrelated errors
+still fail. See the guide for cache recovery and header-only validation limitations.
+
+The supervisor temporarily mounts
 NFS using non-interactive sudo and waits for workers before unmounting on
 completion, failure or interruption; cleanup failures retain the mount and
 print recovery commands. `nfs.frame_root` instead reuses an existing mount

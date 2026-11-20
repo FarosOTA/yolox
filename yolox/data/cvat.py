@@ -25,6 +25,7 @@ import zipfile
 from PIL import Image
 from tqdm import tqdm
 
+from .image_errors import image_errors, record_image_error, warn_image_errors
 
 NFS_IDENTITY = (
     "NFS export maps all clients to nobody (all_squash, anonuid=65534, anongid=65534); "
@@ -113,6 +114,12 @@ class RunReport:
             print("Frame validation: not reached", flush=True)
         if "error_type" in self.data:
             print(f"Stopped in {self.data['failed_phase']} ({self.data['error_type']})", flush=True)
+        self.data["skipped_frames"] = image_errors(output)
+        # Preparation can fail before its output directory is created.
+        for record in validation.get("skipped_frames", []):
+            if record not in self.data["skipped_frames"]:
+                self.data["skipped_frames"].append(record)
+        warn_image_errors(self.data["skipped_frames"], "End of training run")
         if output.is_dir():
             try:
                 (output / "summary.json").write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
@@ -246,7 +253,8 @@ def check_network(cvat_host, frame_root, nfs_server, nfs_export="/"):
     return root
 
 
-def validate_coco(data, frame_root, *, workers=16, full_decode=False, stats=None):
+def validate_coco(data, frame_root, *, workers=16, full_decode=False, stats=None,
+                  skip_invalid=False):
     """Stat and inspect headers in parallel; decode pixels only when explicitly requested."""
     started = time.monotonic()
     images, annotations, categories = (data[key] for key in ("images", "annotations", "categories"))
@@ -286,8 +294,12 @@ def validate_coco(data, frame_root, *, workers=16, full_decode=False, stats=None
         name = image["file_name"]
         path = root / name
         try:
-            if not path.resolve(strict=True).is_relative_to(root):
-                raise ValueError("image symlink escapes frame root")
+            resolved = path.resolve()
+        except OSError as failure:
+            return f"{name}: cannot resolve image path: {failure}", time.monotonic() - frame_started
+        if not resolved.is_relative_to(root):
+            raise ValueError("image symlink escapes frame root")
+        try:
             info = path.stat()
             if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
                 raise ValueError("not a non-empty image file")
@@ -338,8 +350,21 @@ def validate_coco(data, frame_root, *, workers=16, full_decode=False, stats=None
                     "p95": ordered[math.ceil(count * 0.95) - 1] * 1000, "max": ordered[-1] * 1000,
                 }
     if errors:
-        raise ValueError(f"{len(errors)} invalid image(s):\n"
-                         + "\n".join(error for _, error in sorted(errors)[:20]))
+        if not skip_invalid:
+            raise ValueError(f"{len(errors)} invalid image(s):\n"
+                             + "\n".join(error for _, error in sorted(errors)[:20]))
+        records = [{"split": "preparation", "image_id": images[index]["id"],
+                    "path": str(root / images[index]["file_name"]), "reason": error}
+                   for index, error in sorted(errors)]
+        if stats is not None:
+            stats["skipped_frames"] = records
+        warn_image_errors(records, "End of image validation")
+        bad_ids = {record["image_id"] for record in records}
+        data = {**data, "images": [image for image in images if image["id"] not in bad_ids],
+                "annotations": [a for a in annotations if a["image_id"] not in bad_ids]}
+        if not data["images"]:
+            raise ValueError("No readable frames remain after image validation")
+    return data
 
 
 def validation_fingerprint(directory, root):
@@ -611,8 +636,9 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, *, seed=0,
             data = read_export(archive)
     if report is not None:
         report.start_phase("Image validation")
-    validate_coco(data, root, workers=workers, full_decode=full_decode,
-                  stats=report.data["validation"] if report is not None else None)
+    validation_stats = report.data["validation"] if report is not None else {}
+    data = validate_coco(data, root, workers=workers, full_decode=full_decode,
+                         stats=validation_stats, skip_invalid=True)
     if report is not None:
         report.start_phase("Class mapping and 70/15/15 split")
     mapping = merge_classes(data, merge or {}, exclude)
@@ -624,6 +650,8 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, *, seed=0,
                                   "retained_boxes": len(data["annotations"]), "splits": {}}
         report.start_phase("Writing prepared dataset")
     output.mkdir(parents=True)
+    for record in validation_stats.get("skipped_frames", []):
+        record_image_error(output, record)
     (output / "annotations").mkdir()
     for split, filename in SPLIT_FILES.items():
         images = splits[split]
@@ -695,8 +723,14 @@ def preflight_dataset(directory, *, validation_token=None):
         check_local(cache)
         data = json.loads((directory / "annotations" / filename).read_text(encoding="utf-8"))
         if not validated:
-            validate_coco(data, root, workers=manifest.get("validation_workers", 16),
-                          full_decode=manifest.get("full_decode", False))
+            stats = {}
+            try:
+                validate_coco(data, root, workers=manifest.get("validation_workers", 16),
+                              full_decode=manifest.get("full_decode", False), stats=stats,
+                              skip_invalid=True)
+            finally:
+                for record in stats.get("skipped_frames", []):
+                    record_image_error(directory, {**record, "split": f"{split}2017"})
         subsets.append(data)
     classes = [c["name"] for c in sorted(subsets[0]["categories"], key=lambda c: c["id"])]
     if (any(subset["categories"] != subsets[0]["categories"] for subset in subsets[1:])
