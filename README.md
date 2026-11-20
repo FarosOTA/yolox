@@ -15,6 +15,7 @@ toolchain assumptions in the retained upstream material.
 
 - [Installation and compatibility](#installation-and-compatibility)
 - [Training, resume and distributed evaluation](#training-resume-and-distributed-evaluation)
+- [Apple Silicon training and benchmarking](#apple-silicon-training-and-benchmarking)
 - [Experiments, datasets and utility APIs](#experiments-datasets-and-utility-apis)
 - [CVAT and LAN training data](#cvat-and-lan-training-data)
 - [Interactive and headless demos](#interactive-and-headless-demos)
@@ -35,7 +36,8 @@ uv sync --locked --extra cpu --extra export
 uv run --no-sync python tools/demo.py --help
 ```
 
-- `cpu` selects PyTorch's CPU wheels. For NVIDIA development on Linux/Windows,
+- `cpu` selects PyTorch's CPU index; its macOS ARM64 wheels also include MPS
+  acceleration for Apple GPUs. For NVIDIA development on Linux/Windows,
   replace it with `cuda`, which selects **CUDA 13.0** wheels and requires a
   compatible NVIDIA driver. These profiles are mutually exclusive.
 - The declared baseline is torch 2.13+, torchvision 0.28+ and NumPy 1.26–2.x
@@ -56,15 +58,17 @@ uv run --no-sync python tools/demo.py --help
   Wheels include default experiments and `yolox.tools`, so installed tools can
   also run as `python -m yolox.tools.export_onnx` outside the checkout.
 
-CPU inference and export are supported; **training/evaluation CLIs require
-CUDA**, and distributed execution is Linux-only. Windows CUDA is experimental
+CPU inference and export are supported. **Training/evaluation CLIs select CUDA,
+then MPS, then CPU** by default, with an explicit `--device` override. MPS/CPU
+training uses FP32 on one device; distributed execution is Linux/CUDA-only.
+Windows CUDA is experimental
 single-device use. The public model factory accepts CPU/CUDA devices, defaults
 to CUDA when available and CPU otherwise, and rejects MPS/other backends rather
 than silently substituting CPU. The PyTorch demo spells CUDA as `--device gpu`.
 Intel macOS and Windows ARM64 are outside the selected binary baseline;
 Linux ARM64, Jetson and ROCm need separately validated vendor-compatible builds.
 See [platform support and checkpoint trust](docs/platform_support.md) for the
-complete support policy, including Apple Silicon CPU and CoreML limitations.
+complete support policy, including Apple Silicon training and CoreML limitations.
 
 ## Training, resume and distributed evaluation
 
@@ -86,7 +90,8 @@ See the [weights guide](weights/README.md) for individual downloads and a
 smallest-to-largest comparison of checkpoint sizes, parameters, compute and
 COCO accuracy.
 
-Use the existing [Quick Start training instructions](#quick-start) with a CUDA environment.
+Use the existing [Quick Start training instructions](#quick-start), or the
+[Apple Silicon guide](docs/apple_silicon_training.md) for MPS.
 For example, resume the latest checkpoint in an experiment's output directory,
 or select one explicitly:
 
@@ -124,7 +129,32 @@ uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 --resume -c path/
 - The launcher rejects absent/invalid GPU counts and non-Linux distributed
   launches. Distributed RAM caching (`--cache` or `--cache ram`) uses `fork`;
   `--cache disk` no longer unnecessarily selects that start method. These
-  restrictions do not add CPU training or Windows distributed support.
+  distributed paths remain CUDA-only; MPS/CPU use one process without DDP.
+  Parent-side CUDA selection uses `device_count()` (fork-safe when NVML discovery
+  succeeds), leaving CUDA runtime availability checks in distributed workers.
+
+## Apple Silicon training and benchmarking
+
+This fork adds **single-device FP32 training and evaluation on Apple GPUs via
+PyTorch MPS**, including data transfer, multiscale resizing, label assignment,
+EMA, checkpoint save/resume and COCO/VOC evaluation. The normal `tools/train.py`
+and `tools/eval.py` accept `--device auto|cuda|mps|cpu`; explicit requests fail if
+unavailable. `-d` remains a device count, not a backend selector. MPS/CPU require
+one device and one machine. `--fp16`, `--occupy` and TensorRT remain CUDA-only.
+The public model factory and demo device selectors are unchanged.
+
+Use the locked `cpu` profile on macOS; it includes MPS. Start with batch 2–4
+and a small model, since the GPU shares RAM with macOS. MPS training logs report
+current allocated tensor memory, whereas CUDA logs retain peak allocated memory.
+The Linux CVAT/NFS supervisor is not ported to macOS; use a local dataset and
+experiment. See [Apple Silicon training](docs/apple_silicon_training.md) for
+commands, memory limits and validation evidence.
+
+`tools/benchmark_train.py` runs seeded, fixed-batch forward/backward/SGD/EMA
+steps with device synchronization and JSON results. It excludes loading,
+augmentation, validation and checkpoint I/O, so it is **not epoch throughput**.
+The guide includes matched MPS/CUDA commands and measured M5 results; no
+RTX 3060 speed ratio is claimed without running the same benchmark there.
 
 ## Experiments, datasets and utility APIs
 
@@ -410,7 +440,8 @@ uv run --no-sync sphinx-build -b html docs /tmp/yolox-docs
 and [PLAN.md](PLAN.md) retain exact runtime versions, hashes, comparisons and
 limitations. PLAN contains historical iterations; its **final acceptance scope**
 supersedes earlier physical-device gates. Recorded evidence includes Linux and
-Apple Silicon CPU tests/builds, an Asus CUDA training-step smoke test, actual
+Apple Silicon CPU tests/builds, [M5 MPS training and benchmarking](docs/apple_silicon_training.md),
+an Asus CUDA training-step smoke test, actual
 Asus **CPUExecutionProvider** inference of a 640×640 Nano export (maximum raw
 absolute difference 0.000183 versus CUDA Torch at `atol=rtol=0.001`), and separate
 execution of the **416×416 standalone bundle on the orb CPU without Torch**.
@@ -519,8 +550,9 @@ groups are available with `uv sync --extra cpu --extra export --group docs`.
 Use `uv run --no-sync python ...` for the commands below after syncing a profile.
 
 See [supported platforms and checkpoint trust](docs/platform_support.md).
-Training/evaluation CLIs require CUDA; CPU inference/export is supported. MPS is
-explicitly unsupported. Without `--save_result`, demos require a graphical
+Training/evaluation CLIs support CUDA and single-device FP32 MPS/CPU; see the
+[Apple Silicon guide](docs/apple_silicon_training.md). CPU inference/export is
+supported. Without `--save_result`, demos require a graphical
 OpenCV session; save-only mode does not call GUI APIs.
 
 </details>

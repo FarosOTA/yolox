@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import onnx
 import onnxruntime
+import pytest
 import torch
 
 from yolox.exp import get_exp
@@ -23,14 +24,30 @@ def test_model_inference():
     assert torch.isfinite(output).all()
 
 
-def test_model_training_with_empty_and_positive_images():
-    model = yolox_nano(pretrained=False, device="cpu").train()
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "mps", marks=pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+)])
+def test_model_training_with_empty_and_positive_images(device):
+    torch.manual_seed(42)
+    model = yolox_nano(pretrained=False, device="cpu").to(device).train()
+    model.head.use_l1 = True
     labels = torch.zeros(2, 4, 5)
     labels[1, 0] = torch.tensor([2, 24, 30, 16, 18])
-    loss = model(torch.randn(2, 3, 64, 64), labels)["total_loss"]
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01 * 2 / 64)
+    before = next(model.parameters()).detach().clone()
+    images = (torch.rand(2, 3, 64, 64) * 255).to(device)
+    loss = model(images, labels.to(device))["total_loss"]
     assert torch.isfinite(loss) and loss > 0
+    assert loss.device.type == device
     loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    optimizer.step()
+    assert not torch.equal(before, next(model.parameters()))
+    model.eval()
+    with torch.no_grad():
+        output = model(torch.zeros(1, 3, 96, 64, device=device))
+    assert output.shape == (1, 126, 85)
+    assert output.device.type == device and torch.isfinite(output).all()
 
 
 def test_deploy_import_does_not_load_torch():

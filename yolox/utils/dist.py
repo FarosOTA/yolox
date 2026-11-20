@@ -281,8 +281,12 @@ def shared_random_seed():
     return all_ints[0]
 
 
-def time_synchronized():
+def time_synchronized(device=None):
     """pytorch-accurate time"""
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if device is not None and torch.device(device).type == "mps":
+        torch.mps.synchronize()
+    elif (device is None and torch.cuda.is_available()) or (
+        device is not None and torch.device(device).type == "cuda"
+    ):
+        torch.cuda.synchronize(device)
     return time.time()

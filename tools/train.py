@@ -12,7 +12,7 @@ import torch.backends.cudnn as cudnn
 
 from yolox.core import launch
 from yolox.exp import Exp, check_exp_value, get_exp
-from yolox.utils import configure_module, configure_nccl, configure_omp, get_num_devices
+from yolox.utils import configure_module, configure_nccl, configure_omp, resolve_device
 
 
 def make_parser():
@@ -35,8 +35,10 @@ def make_parser():
         help="url used to set up distributed training",
     )
     parser.add_argument("-b", "--batch-size", type=int, default=64, help="batch size")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto",
+                        help="Training backend (auto: CUDA, MPS, then CPU)")
     parser.add_argument(
-        "-d", "--devices", default=None, type=int, help="device for training"
+        "-d", "--devices", default=None, type=int, help="device count (MPS/CPU: 1)"
     )
     parser.add_argument(
         "-f",
@@ -101,7 +103,7 @@ def make_parser():
     return parser
 
 
-@logger.catch
+@logger.catch(reraise=True)
 def main(exp: Exp, args):
     if exp.seed is not None:
         random.seed(exp.seed)
@@ -135,8 +137,10 @@ if __name__ == "__main__":
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
 
-    num_gpu = get_num_devices() if args.devices is None else args.devices
-    assert num_gpu <= get_num_devices()
+    args.device = resolve_device(args.device).type
+    num_gpu = args.devices if args.devices is not None else (
+        torch.cuda.device_count() if args.device == "cuda" else 1
+    )
 
     if args.cache is not None:
         exp.dataset = exp.get_dataset(cache=True, cache_type=args.cache)
@@ -150,4 +154,5 @@ if __name__ == "__main__":
         backend=args.dist_backend,
         dist_url=dist_url,
         args=(exp, args),
+        device=args.device,
     )

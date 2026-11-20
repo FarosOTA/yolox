@@ -14,11 +14,128 @@ import torch
 from pycocotools.coco import COCO
 from torch import nn
 
-from yolox.core import Trainer
+from yolox.core import Trainer, launch
 from yolox.data.datasets import COCODataset
 from yolox.exp import get_exp
 from yolox.layers.fast_coco_eval_api import COCOeval_opt
-from yolox.utils import ModelEMA, adjust_status, replace_module
+from yolox.utils import ModelEMA, adjust_status, replace_module, resolve_device
+
+
+def test_device_selection_and_single_device_launch(monkeypatch):
+    for cuda, mps, expected in ((True, True, "cuda"), (False, True, "mps"),
+                                (False, False, "cpu")):
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 2 if cuda else 0)
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
+        assert resolve_device().type == expected
+        assert resolve_device("cpu").type == "cpu"
+    for device in ("cuda", "mps"):
+        with pytest.raises(RuntimeError, match="not available"):
+            resolve_device(device)
+    called = []
+    launch(called.append, 1, args=("executed",), device="cpu")
+    assert called == ["executed"]
+    for devices, machines, rank in ((0, 1, 0), (2, 1, 0), (1, 2, 0), (1, 1, 1)):
+        with pytest.raises(ValueError, match="one device"):
+            launch(called.append, devices, machines, rank, args=("invalid",), device="cpu")
+    assert called == ["executed"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="RAM caching uses Unix fork")
+@pytest.mark.parametrize("device", ["auto", "cuda"])
+def test_cuda_ram_cache_launch_does_not_initialize_parent(tmp_path, device):
+    # Use real forks in a fresh interpreter, with simulated CUDA runtime state.
+    # A runtime initialized in the parent must reject use from its children.
+    script = """
+import importlib
+import os
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+import torch
+from yolox.utils import resolve_device
+
+launcher = importlib.import_module('yolox.core.launch')
+owner_pid = None
+def cuda_available():
+    global owner_pid
+    if owner_pid is not None and owner_pid != os.getpid():
+        raise RuntimeError('Cannot re-initialize CUDA in forked subprocess')
+    owner_pid = os.getpid()
+    return True
+
+def worker(rank, main_func, *args):
+    assert torch.cuda.is_available()
+    main_func(rank)
+
+def main(rank):
+    Path(sys.argv[1], str(rank)).write_text('CUDA initialized in worker')
+
+with patch.object(torch.cuda, 'is_available', cuda_available), \
+     patch.object(torch.cuda, 'device_count', return_value=2), \
+     patch.object(launcher, 'sys', SimpleNamespace(platform='linux')), \
+     patch.object(launcher, '_distributed_worker', worker):
+    device = resolve_device(sys.argv[2]).type
+    launcher.launch(main, 2, args=(None, SimpleNamespace(cache='ram')), device=device)
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path), device],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for rank in (0, 1):
+        assert (tmp_path / str(rank)).read_text() == "CUDA initialized in worker"
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "mps", marks=pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+)])
+def test_training_cli_evaluation_and_resume(tmp_path, device):
+    """Real COCO loader, training, EMA, validation and resume on non-CUDA backends."""
+    (tmp_path / "annotations").mkdir()
+    (tmp_path / "train2017").mkdir()
+    (tmp_path / "val2017").mkdir()
+    images, annotations = [], []
+    for i in range(4):
+        image = np.full((48, 64, 3), 70 + i * 20, dtype=np.uint8)
+        image[9:31, 13:38] = (230, 80, 10)
+        for split in ("train2017", "val2017"):
+            cv2.imwrite(str(tmp_path / split / f"{i}.png"), image)
+        images.append({"id": i, "file_name": f"{i}.png", "height": 48, "width": 64})
+        if i % 2:
+            annotations.append({"id": i, "image_id": i, "category_id": 4,
+                                "bbox": [13, 9, 25, 22], "area": 550, "iscrowd": 0})
+    data = {"images": images, "annotations": annotations,
+            "categories": [{"id": 4, "name": "object"}]}
+    for split in ("train2017", "val2017"):
+        (tmp_path / "annotations" / f"instances_{split}.json").write_text(json.dumps(data))
+    common = ["-n", "yolox-nano", "--device", device, "-b", "2", "-expn", "smoke"]
+    overrides = ["data_dir", str(tmp_path), "output_dir", str(tmp_path / "runs"),
+                 "input_size", "(64,64)", "test_size", "(64,64)", "num_classes", "1",
+                 "data_num_workers", "0", "warmup_epochs", "0", "no_aug_epochs", "0",
+                 "eval_interval", "1", "print_interval", "1", "multiscale_range", "0",
+                 "test_conf", "0.0"]
+    train = [sys.executable, "-m", "yolox.tools.train", *common]
+    checkpoint = tmp_path / "runs/smoke/latest_ckpt.pth"
+    previous = None
+    for epoch in (1, 2):
+        command = train + (["--resume"] if epoch == 2 else [])
+        result = subprocess.run(command + overrides + ["max_epoch", str(epoch)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        assert saved["start_epoch"] == epoch and saved["ema_updates"] == 2 * epoch
+        assert saved["optimizer"]["state"] and saved["scaler"] == {}
+        weights = saved["training_model"]
+        assert all(torch.isfinite(value).all() for value in weights.values())
+        if previous is not None:
+            assert any(not torch.equal(weights[key], previous[key]) for key in weights)
+        previous = weights
+        assert "Average Precision" in (tmp_path / "runs/smoke/train_log.txt").read_text()
+    result = subprocess.run(
+        [sys.executable, "-m", "yolox.tools.eval", *common, "-c", str(checkpoint), *overrides],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Average Precision" in (tmp_path / "runs/smoke/val_log.txt").read_text()
 
 
 def test_experiment_overrides_and_file_identity(tmp_path):

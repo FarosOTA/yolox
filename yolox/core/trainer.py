@@ -29,6 +29,7 @@ from yolox.utils import (
     load_ckpt,
     mem_usage,
     occupy_mem,
+    resolve_device,
     save_checkpoint,
     setup_logger,
     synchronize
@@ -45,11 +46,13 @@ class Trainer:
         # training related attr
         self.max_epoch = exp.max_epoch
         self.amp_training = args.fp16
-        self.scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
         self.is_distributed = get_world_size() > 1
         self.rank = get_rank()
         self.local_rank = get_local_rank()
-        self.device = "cuda:{}".format(self.local_rank)
+        self.device = resolve_device(getattr(args, "device", "cuda"), self.local_rank)
+        if self.device.type != "cuda" and (args.fp16 or args.occupy):
+            raise ValueError("--fp16 and --occupy require CUDA; MPS/CPU training uses FP32")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
         self.use_model_ema = exp.ema
         self.save_history_ckpt = exp.save_history_ckpt
 
@@ -105,7 +108,7 @@ class Trainer:
         inps, targets = self.exp.preprocess(inps, targets, self.input_size)
         data_end_time = time.time()
 
-        with torch.amp.autocast("cuda", enabled=self.amp_training):
+        with torch.amp.autocast(self.device.type, enabled=self.amp_training):
             outputs = self.model(inps, targets)
 
         loss = outputs["total_loss"]
@@ -135,7 +138,8 @@ class Trainer:
         logger.info("exp value:\n{}".format(self.exp))
 
         # model related init
-        torch.cuda.set_device(self.local_rank)
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.local_rank)
         model = self.exp.get_model()
         logger.info(
             "Model Summary: {}".format(get_model_info(model, self.exp.test_size))
@@ -157,7 +161,7 @@ class Trainer:
             cache_img=self.args.cache,
         )
         logger.info("init prefetcher, this might take one minute or less...")
-        self.prefetcher = DataPrefetcher(self.train_loader)
+        self.prefetcher = DataPrefetcher(self.train_loader, self.device)
         # max_iter means iters per epoch
         self.max_iter = len(self.train_loader)
 
@@ -273,7 +277,9 @@ class Trainer:
                 ["{}: {:.3f}s".format(k, v.avg) for k, v in time_meter.items()]
             )
 
-            mem_str = "gpu mem: {:.0f}Mb, mem: {:.1f}Gb".format(gpu_mem_usage(), mem_usage())
+            mem_str = "gpu mem: {:.0f}Mb, mem: {:.1f}Gb".format(
+                gpu_mem_usage(self.device), mem_usage()
+            )
 
             logger.info(
                 "{}, {}, {}, {}, lr: {:.3e}".format(
@@ -338,7 +344,7 @@ class Trainer:
             state = ckpt.get("training_model", ckpt["model"])
             model.load_state_dict(state)
             self.optimizer.load_state_dict(ckpt["optimizer"])
-            if "scaler" in ckpt:
+            if ckpt.get("scaler"):
                 self.scaler.load_state_dict(ckpt["scaler"])
             self.resume_checkpoint = ckpt
             self.best_ap = ckpt.get("best_ap", 0)

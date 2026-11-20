@@ -42,11 +42,16 @@ def occupy_mem(cuda_device, mem_ratio=0.9):
     time.sleep(5)
 
 
-def gpu_mem_usage():
+def gpu_mem_usage(device=None):
     """
     Compute the GPU memory usage for the current device (MB).
     """
-    mem_usage_bytes = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    if device is not None and torch.device(device).type == "mps":
+        mem_usage_bytes = torch.mps.current_allocated_memory()
+    elif device is not None and torch.device(device).type == "cpu":
+        mem_usage_bytes = 0
+    else:
+        mem_usage_bytes = torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
     return mem_usage_bytes / (1024 * 1024)
 
 

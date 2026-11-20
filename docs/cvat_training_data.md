@@ -11,7 +11,9 @@ the server, copies the frame tree locally, or modifies source images.
 
 The training client needs Linux, `ip` (iproute2), `findmnt` (util-linux),
 readable `/sys/class/net/<interface>/{speed,duplex}`, and NFS mount helpers
-(for example `nfs-common`). The training CLI requires CUDA. Install with:
+(for example `nfs-common`). CUDA is the recommended training profile for this
+workflow. The general training CLI also supports single-device FP32 CPU/MPS,
+but this Linux supervisor is not ported to macOS. Install with:
 
 ```sh
 uv sync --locked --extra cuda --extra export --extra cvat

@@ -220,8 +220,9 @@ class YOLOXHead(nn.Module):
         hsize, wsize = output.shape[-2:]
         if grid.shape[2:4] != output.shape[2:4]:
             yv, xv = meshgrid([torch.arange(hsize), torch.arange(wsize)])
-            grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2).type(dtype)
-            self.grids[k] = grid
+            grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2)
+        grid = grid.to(output)
+        self.grids[k] = grid
 
         output = output.view(batch_size, 1, n_ch, hsize, wsize)
         output = output.permute(0, 1, 3, 4, 2).reshape(
@@ -242,8 +243,8 @@ class YOLOXHead(nn.Module):
             shape = grid.shape[:2]
             strides.append(torch.full((*shape, 1), stride))
 
-        grids = torch.cat(grids, dim=1).type(dtype)
-        strides = torch.cat(strides, dim=1).type(dtype)
+        grids = torch.cat(grids, dim=1).to(outputs)
+        strides = torch.cat(strides, dim=1).to(outputs)
 
         outputs = torch.cat([
             (outputs[..., 0:2] + grids) * strides,
@@ -350,7 +351,8 @@ class YOLOXHead(nn.Module):
                         "cpu",
                     )
 
-                torch.cuda.empty_cache()
+                if outputs.device.type == "cuda":
+                    torch.cuda.empty_cache()
                 num_fg += num_fg_img
 
                 cls_target = F.one_hot(
@@ -434,7 +436,7 @@ class YOLOXHead(nn.Module):
         obj_preds,
         mode="gpu",
     ):
-
+        device = bboxes_preds_per_image.device
         if mode == "cpu":
             print("-----------Using CPU for the Current Batch-------------")
             gt_bboxes_per_image = gt_bboxes_per_image.cpu().float()
@@ -452,8 +454,8 @@ class YOLOXHead(nn.Module):
         )
 
         bboxes_preds_per_image = bboxes_preds_per_image[fg_mask]
-        cls_preds_ = cls_preds[batch_idx][fg_mask]
-        obj_preds_ = obj_preds[batch_idx][fg_mask]
+        cls_preds_ = cls_preds[batch_idx].to(fg_mask.device)[fg_mask]
+        obj_preds_ = obj_preds[batch_idx].to(fg_mask.device)[fg_mask]
         num_in_boxes_anchor = bboxes_preds_per_image.shape[0]
 
         if mode == "cpu":
@@ -497,10 +499,10 @@ class YOLOXHead(nn.Module):
         del pair_wise_cls_loss, cost, pair_wise_ious, pair_wise_ious_loss
 
         if mode == "cpu":
-            gt_matched_classes = gt_matched_classes.cuda()
-            fg_mask = fg_mask.cuda()
-            pred_ious_this_matching = pred_ious_this_matching.cuda()
-            matched_gt_inds = matched_gt_inds.cuda()
+            gt_matched_classes = gt_matched_classes.to(device)
+            fg_mask = fg_mask.to(device)
+            pred_ious_this_matching = pred_ious_this_matching.to(device)
+            matched_gt_inds = matched_gt_inds.to(device)
 
         return (
             gt_matched_classes,

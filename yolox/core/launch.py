@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import yolox.utils.dist as comm
+from yolox.utils.device import resolve_device
 
 __all__ = ["launch"]
 
@@ -45,6 +46,7 @@ def launch(
     dist_url=None,
     args=(),
     timeout=DEFAULT_TIMEOUT,
+    device="cuda",
 ):
     """
     Args:
@@ -55,7 +57,14 @@ def launch(
                        e.g. "tcp://127.0.0.1:8686".
                        Can be set to auto to automatically select a free port on localhost
         args (tuple): arguments passed to main_func
+        device (str): cuda, mps or cpu; only CUDA supports distributed execution
     """
+    device = resolve_device(device)
+    if device.type != "cuda":
+        if num_gpus_per_machine != 1 or num_machines != 1 or machine_rank != 0:
+            raise ValueError("MPS/CPU execution requires one device, one machine and rank zero")
+        main_func(*args)
+        return
     if num_gpus_per_machine < 1 or num_gpus_per_machine > torch.cuda.device_count():
         raise RuntimeError("Training/evaluation requires at least one available CUDA device")
     world_size = num_machines * num_gpus_per_machine

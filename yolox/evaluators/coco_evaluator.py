@@ -7,7 +7,6 @@ import io
 import itertools
 import json
 import tempfile
-import time
 from collections import ChainMap, defaultdict
 from loguru import logger
 from tabulate import tabulate
@@ -133,7 +132,8 @@ class COCOEvaluator:
             summary (sr): summary info of evaluation.
         """
         # TODO half to amp_test
-        tensor_type = torch.cuda.HalfTensor if half else torch.cuda.FloatTensor
+        device = next(model.parameters()).device
+        dtype = torch.float16 if half else torch.float32
         model = model.eval()
         if half:
             model = model.half()
@@ -160,26 +160,26 @@ class COCOEvaluator:
             progress_bar(self.dataloader)
         ):
             with torch.no_grad():
-                imgs = imgs.type(tensor_type)
+                imgs = imgs.to(device=device, dtype=dtype)
 
                 # skip the last iters since batchsize might be not enough for batch inference
                 is_time_record = cur_iter < len(self.dataloader) - 1
                 if is_time_record:
-                    start = time.time()
+                    start = time_synchronized(device)
 
                 outputs = model(imgs)
                 if decoder is not None:
                     outputs = decoder(outputs, dtype=outputs.type())
 
                 if is_time_record:
-                    infer_end = time_synchronized()
+                    infer_end = time_synchronized(device)
                     inference_time += infer_end - start
 
                 outputs = postprocess(
                     outputs, self.num_classes, self.confthre, self.nmsthre
                 )
                 if is_time_record:
-                    nms_end = time_synchronized()
+                    nms_end = time_synchronized(device)
                     nms_time += nms_end - infer_end
 
             data_list_elem, image_wise_data = self.convert_to_coco_format(
@@ -190,7 +190,7 @@ class COCOEvaluator:
             data_by_image.update(batch_data)
             output_data.update(image_wise_data)
 
-        statistics = torch.cuda.FloatTensor([inference_time, nms_time, n_samples])
+        statistics = torch.tensor([inference_time, nms_time, n_samples], device=device)
         if distributed:
             # different process/device might have different speed,
             # to make sure the process will not be stucked, sync func is used here.

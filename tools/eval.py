@@ -20,6 +20,7 @@ from yolox.utils import (
     fuse_model,
     get_local_rank,
     get_model_info,
+    resolve_device,
     setup_logger
 )
 
@@ -43,8 +44,10 @@ def make_parser():
         help="url used to set up distributed training",
     )
     parser.add_argument("-b", "--batch-size", type=int, default=64, help="batch size")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto",
+                        help="Evaluation backend (auto: CUDA, MPS, then CPU)")
     parser.add_argument(
-        "-d", "--devices", default=None, type=int, help="device for training"
+        "-d", "--devices", default=None, type=int, help="device count (MPS/CPU: 1)"
     )
     parser.add_argument(
         "--num_machines", default=1, type=int, help="num of node for training"
@@ -115,8 +118,11 @@ def make_parser():
     return parser
 
 
-@logger.catch
+@logger.catch(reraise=True)
 def main(exp, args, num_gpu):
+    device = resolve_device(args.device, get_local_rank())
+    if device.type != "cuda" and (args.fp16 or args.trt):
+        raise ValueError("--fp16 and --trt require CUDA; MPS/CPU evaluation uses FP32")
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -156,8 +162,9 @@ def main(exp, args, num_gpu):
     evaluator.per_class_AP = True
     evaluator.per_class_AR = True
 
-    torch.cuda.set_device(rank)
-    model.cuda(rank)
+    if device.type == "cuda":
+        torch.cuda.set_device(rank)
+    model.to(device)
     model.eval()
 
     if not args.speed and not args.trt:
@@ -166,8 +173,7 @@ def main(exp, args, num_gpu):
         else:
             ckpt_file = args.ckpt
         logger.info("loading checkpoint from {}".format(ckpt_file))
-        loc = "cuda:{}".format(rank)
-        ckpt = torch.load(ckpt_file, map_location=loc, weights_only=True)
+        ckpt = torch.load(ckpt_file, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
 
@@ -217,8 +223,10 @@ if __name__ == "__main__":
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
 
-    num_gpu = torch.cuda.device_count() if args.devices is None else args.devices
-    assert num_gpu <= torch.cuda.device_count()
+    args.device = resolve_device(args.device).type
+    num_gpu = args.devices if args.devices is not None else (
+        torch.cuda.device_count() if args.device == "cuda" else 1
+    )
 
     dist_url = "auto" if args.dist_url is None else args.dist_url
     launch(
@@ -229,4 +237,5 @@ if __name__ == "__main__":
         backend=args.dist_backend,
         dist_url=dist_url,
         args=(exp, args, num_gpu),
+        device=args.device,
     )

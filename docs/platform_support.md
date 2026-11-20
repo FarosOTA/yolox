@@ -34,19 +34,22 @@ require a compatible glibc (current PyTorch wheels use manylinux 2.28).
 
 | Target | Contract |
 | --- | --- |
-| Linux x86-64 CPU | Installation, inference, export and automated tests |
-| Windows x86-64 CPU | Installation, inference and export; CI validation required |
-| macOS Apple Silicon CPU | Installation, inference and export; ARM64 CI validation required |
+| Linux x86-64 CPU | Installation, inference, export, single-device FP32 training/evaluation and automated tests |
+| Windows x86-64 CPU | Same CPU paths; CI validation required |
+| macOS Apple Silicon CPU | Same CPU paths; ARM64 CI validation required |
 | Linux x86-64 NVIDIA CUDA | Primary training and evaluation backend; hardware validation required |
 | Windows CUDA | Experimental single-device use; distributed and caching restrictions apply |
-| Apple MPS | Not a supported training/evaluation backend; never silently substitute CPU |
+| Apple MPS | Single-device FP32 training/evaluation; explicit unavailable requests fail; see the [Apple Silicon guide](apple_silicon_training.md) |
 | Intel macOS / Windows ARM64 | Not supported by the selected modern binary dependency baseline |
 | Linux ARM64 / Jetson / AMD ROCm | Experimental; use hardware/vendor-compatible torch builds and validate separately |
 | Android / native deployment demos | Separate optional integrations, not part of Python package support |
 
 This table defines the intended support boundary, not a claim that every target
-has already passed validation. Only executed checks are recorded in `PLAN.md`.
-CPU inference does not imply CPU training. CUDA-named torch APIs also run on ROCm,
+has already passed validation. Historical checks are recorded in `PLAN.md`;
+new MPS evidence is in the [Apple Silicon guide](apple_silicon_training.md).
+Training/evaluation CLIs default to CUDA, then MPS, then CPU. MPS/CPU are
+single-process FP32 paths; mixed precision and distributed execution remain
+CUDA-only. CUDA-named torch APIs also run on ROCm,
 but NVIDIA-specific utilities and available binary distributions can still limit it.
 
 On 2026-10-26, a MacBook Air M5 (macOS 27.0.1, arm64) passed the locked CPU/export
@@ -62,7 +65,8 @@ On that M5, default CoreML executed a hybrid CoreML/CPU graph but shifted retain
 boxes by up to 3.02 input-coordinate pixels relative to PyTorch. CoreML CPU-only
 options reduced those differences, but GPU/ANE placement and the cause were not
 established. Default CoreML acceleration is not numerically certified here;
-the maintained Apple Silicon path remains explicit CPU execution, not MPS.
+the maintained Apple Silicon **ONNX deployment** path remains explicit CPU
+execution. MPS training is a separate PyTorch path and does not certify CoreML.
 
 The Asus RTX 3060 Laptop GPU (Ubuntu 26.04.1, driver 595.91.07) passed the locked
 CUDA 13.0 profile's 17 tests on Python 3.12 after supplying missing OpenCV runtime

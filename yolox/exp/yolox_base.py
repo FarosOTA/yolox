@@ -210,7 +210,9 @@ class Exp(BaseExp):
             mosaic=not no_aug,
         )
 
-        dataloader_kwargs = {"num_workers": self.data_num_workers, "pin_memory": True}
+        dataloader_kwargs = {
+            "num_workers": self.data_num_workers, "pin_memory": torch.cuda.is_available()
+        }
         dataloader_kwargs["batch_sampler"] = batch_sampler
 
         # Make sure each process has different random seed, especially for 'fork' method.
@@ -222,7 +224,7 @@ class Exp(BaseExp):
         return train_loader
 
     def random_resize(self, data_loader, epoch, rank, is_distributed):
-        tensor = torch.LongTensor(2).cuda()
+        tensor = torch.empty(2, dtype=torch.long, device="cuda" if is_distributed else "cpu")
 
         if rank == 0:
             size_factor = self.input_size[1] * 1.0 / self.input_size[0]
@@ -322,7 +324,7 @@ class Exp(BaseExp):
 
         dataloader_kwargs = {
             "num_workers": self.data_num_workers,
-            "pin_memory": True,
+            "pin_memory": torch.cuda.is_available(),
             "sampler": sampler,
         }
         dataloader_kwargs["batch_size"] = batch_size

@@ -18,6 +18,7 @@ Welcome to YOLOX's documentation!
    :caption: Tutorials
 
    train_custom_data
+   apple_silicon_training
    cvat_training_data
 
 .. toctree::
