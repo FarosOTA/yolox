@@ -26,7 +26,6 @@ from yolox.utils import (
     get_world_size,
     gpu_mem_usage,
     is_parallel,
-    load_ckpt,
     mem_usage,
     occupy_mem,
     resolve_device,
@@ -34,6 +33,7 @@ from yolox.utils import (
     setup_logger,
     synchronize
 )
+from yolox.utils.checkpoint import checkpoint_class_names, load_finetune_checkpoint
 
 
 class Trainer:
@@ -330,6 +330,12 @@ class Trainer:
             else:
                 ckpt_file = self.args.ckpt
 
+            if getattr(self.args, "prepared_data", None) and hasattr(self.exp, "class_names"):
+                names, _ = checkpoint_class_names(
+                    ckpt_file, getattr(self.args, "checkpoint_classes", None))
+                if names != self.exp.class_names:
+                    raise ValueError("Resume requires identical ordered classes; use fine-tuning "
+                                     "without --resume to remap the classifier")
             ckpt = torch.load(ckpt_file, map_location=self.device, weights_only=True)
             for name in ("model", "training_model"):
                 state = ckpt.get(name)
@@ -364,8 +370,10 @@ class Trainer:
             if self.args.ckpt is not None:
                 logger.info("loading checkpoint for fine tuning")
                 ckpt_file = self.args.ckpt
-                ckpt = torch.load(ckpt_file, map_location=self.device, weights_only=True)["model"]
-                model = load_ckpt(model, ckpt)
+                model = load_finetune_checkpoint(
+                    model, ckpt_file, class_names=getattr(self.exp, "class_names", None),
+                    init_from_coco=getattr(self.exp, "init_from_coco", None),
+                    checkpoint_classes=getattr(self.args, "checkpoint_classes", None))
             self.start_epoch = 0
 
         return model

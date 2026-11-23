@@ -1217,3 +1217,65 @@ def test_export_status_retry_and_credential_redaction(tmp_path, monkeypatch, sta
             assert "test-pat-not-a-real-secret" not in "".join(traceback.format_exception(error.value))
     assert len(attempts) == (2 if status == 503 else 1)
     assert delays == ([3] if status == 503 else [])
+
+
+def test_explicit_taxonomy_preparation_and_checkpoint_config(lan, synthetic, tmp_path):
+    from tools.train import make_parser
+    from tools.train_cvat import load_config, training_arguments
+    import torch
+
+    original = copy.deepcopy(synthetic)
+    output = tmp_path / "ordered"
+    cvat.prepare_dataset(HOST, 42, lan.root, output, data=synthetic,
+                         nfs_server="192.0.2.10", names=["car", "person"],
+                         init_from_coco={"person": "person", "car": ["car", "bus", "truck"]})
+    exp = get_exp(exp_name="yolox-nano")
+    cvat.configure_training(exp, output)
+    assert exp.class_names == ["car", "person"]
+    assert exp.init_from_coco == {"car": ["car", "bus", "truck"], "person": "person"}
+    assert json.loads((output / "classes.json").read_text()) == exp.class_names
+    for filename in cvat.SPLIT_FILES.values():
+        data = json.loads((output / "annotations" / filename).read_text())
+        assert data["categories"] == [{"id": 1, "name": "car"}, {"id": 2, "name": "person"}]
+    train = exp.get_dataset()
+    assert train._classes == ("car", "person")
+    assert train.pull_item(0)[1][0, 4] == 0
+    checkpoint = tmp_path / "custom.pth"
+    torch.save({"model": {}}, checkpoint)
+    path = tmp_path / "train.toml"
+    path.write_text(f'[cvat]\nhost = "{HOST}"\nproject_id = 42\n'
+                    '[nfs]\nserver = "192.0.2.11"\n'
+                    '[training]\ncheckpoint = "custom.pth"\n'
+                    'checkpoint_classes = "ordered/classes.json"\n'
+                    '[classes]\nnames = ["car", "person"]\n'
+                    '[classes.init_from_coco]\ncar = ["car", "bus", "truck"]\n')
+    config = load_config(path)
+    assert config["classes"]["init_from_coco"]["car"] == ["car", "bus", "truck"]
+    parsed = make_parser().parse_args(training_arguments(config, tmp_path / "next-run"))
+    assert parsed.checkpoint_classes == str(output / "classes.json")
+    # Missing/extra dataset categories must not silently acquire the wrong output indices.
+    for names, message in [(["car"], "absent from classes.names"),
+                           (["car", "person", "truck"], "missing from dataset")]:
+        with pytest.raises(ValueError, match=message):
+            cvat.merge_classes(copy.deepcopy(original), {}, names=names)
+
+
+@pytest.mark.parametrize("settings", [
+    'names = ["car", "car"]',
+    'names = []',
+    'names = ["car"]\n[classes.init_from_coco]\ncar = "motorbike"',
+    'names = ["car"]\n[classes.init_from_coco]\ntruck = "truck"',
+    'names = ["car"]\n[classes.init_from_coco]\ncar = []',
+    'names = ["car"]\n[classes.init_from_coco]\ncar = ["car", "car"]',
+    'names = ["car"]\n[classes.init_from_coco]\ncar = ["car", "motorbike"]',
+    'names = ["car"]\n[classes.init_from_coco]\ncar = ["car", 1]',
+    'names = ["car"]\n[classes.init_from_coco]\ncar = 1',
+    '[classes.init_from_coco]\ncar = "car"',
+])
+def test_invalid_class_initialization_config(tmp_path, settings):
+    from tools.train_cvat import load_config
+    path = tmp_path / "train.toml"
+    path.write_text(f'[cvat]\nhost = "{HOST}"\nproject_id = 42\n'
+                    '[nfs]\nserver = "192.0.2.11"\n[classes]\n' + settings + '\n')
+    with pytest.raises(ValueError):
+        load_config(path)

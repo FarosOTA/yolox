@@ -66,7 +66,7 @@ class COCODataset(CacheDataset):
         self.ids = self.coco.getImgIds()
         self.num_imgs = len(self.ids)
         self.class_ids = sorted(self.coco.getCatIds())
-        self.cats = self.coco.loadCats(self.coco.getCatIds())
+        self.cats = self.coco.loadCats(self.class_ids)
         self._classes = tuple([c["name"] for c in self.cats])
         self.name = name
         self.img_size = img_size

@@ -352,3 +352,96 @@ def test_megengine_weight_bridge_without_megengine(tmp_path):
         assert set(arrays.files) == set(weights)
         for name, expected in weights.items():
             np.testing.assert_array_equal(arrays[name], expected.numpy())
+
+
+@pytest.mark.parametrize("official", [False, True])
+@pytest.mark.parametrize("coco_source", ["car", ["car"], ["car", "bus", "truck"]])
+def test_named_checkpoint_initialization(tmp_path, monkeypatch, official, coco_source):
+    import hashlib
+    from yolox.models import YOLOXHead
+    from yolox.deploy.coco_classes import COCO_CLASSES
+    from yolox.utils.checkpoint import OFFICIAL_CHECKPOINTS, load_finetune_checkpoint
+
+    source_names = list(COCO_CLASSES) if official else ["person", "removed", "car"]
+    source = nn.Module()
+    source.head = YOLOXHead(len(source_names), width=0.125)
+    with torch.no_grad():
+        for level, conv in enumerate(source.head.cls_preds):
+            for index in range(len(source_names)):
+                conv.weight[index].fill_(level * 100 + index + 0.25)
+                conv.bias[index].fill_(level * 100 + index + 0.75)
+    path = tmp_path / "checkpoint.pth"
+    torch.save({"model": {"module." + k: v for k, v in source.state_dict().items()}}, path)
+    class_file = tmp_path / "classes.json"
+    class_file.write_text(json.dumps(source_names))
+    if official:
+        # Synthetic registry entry exercises verified-file handling without network in unit tests.
+        monkeypatch.setitem(OFFICIAL_CHECKPOINTS, hashlib.sha256(path.read_bytes()).hexdigest(), "test")
+    target = nn.Module()
+    target.head = YOLOXHead(3, width=0.125)
+    target.head.initialize_biases(0.01)
+    fresh = {k: v.clone() for k, v in target.state_dict().items()}
+    parameters = list(target.parameters())
+    load_finetune_checkpoint(
+        target, path, class_names=["car", "new_damage", "person"],
+        # Custom weights win even when the historical COCO initializer names another row.
+        init_from_coco={"car": coco_source if official else ["bus", "truck"], "person": "person"},
+        checkpoint_classes=None if official else class_file)
+    assert all(a is b for a, b in zip(parameters, target.parameters()))
+    for level in range(3):
+        for kind in ("weight", "bias"):
+            key = f"head.cls_preds.{level}.{kind}"
+            actual = target.state_dict()[key]
+            expected = source.state_dict()[key]
+            car_row = expected[source_names.index("car")]
+            if official and coco_source == ["car", "bus", "truck"]:
+                # Independent arithmetic expectation catches first-row-only or summed initializers.
+                car_row = (car_row + expected[source_names.index("bus")]
+                           + expected[source_names.index("truck")]) / 3
+            torch.testing.assert_close(actual[0], car_row)
+            torch.testing.assert_close(actual[2], expected[source_names.index("person")])
+            torch.testing.assert_close(actual[1], fresh[key][1])
+    for key, actual in target.state_dict().items():
+        if not key.startswith("head.cls_preds."):
+            torch.testing.assert_close(actual, source.state_dict()[key])
+
+
+def test_unknown_checkpoint_and_incompatible_taxonomies_fail(tmp_path):
+    from yolox.models import YOLOXHead
+    from yolox.utils.checkpoint import load_finetune_checkpoint
+
+    model = nn.Module()
+    model.head = YOLOXHead(80, width=0.125)
+    path = tmp_path / "yolox_nano.pth"
+    torch.save({"model": model.state_dict()}, path)
+    model = nn.Module()
+    model.head = YOLOXHead(1, width=0.125)
+    with pytest.raises(ValueError, match="Unknown checkpoint taxonomy"):
+        load_finetune_checkpoint(model, path, class_names=["car"])
+    classes = tmp_path / "classes.json"
+    classes.write_text(json.dumps([f"custom_{i}" for i in range(80)]))
+    with pytest.raises(ValueError, match="cannot be applied from this custom file"):
+        load_finetune_checkpoint(model, path, class_names=["car"],
+                                init_from_coco={"car": "car"}, checkpoint_classes=classes)
+    classes.write_text('["car"]')
+    with pytest.raises(ValueError, match="classifier/class-list mismatch"):
+        load_finetune_checkpoint(model, path, class_names=["car"], checkpoint_classes=classes)
+    classes.write_text(json.dumps([f"custom_{i}" for i in range(80)]))
+    incompatible = nn.Module()
+    incompatible.head = YOLOXHead(2, width=0.25)
+    with pytest.raises(ValueError, match="architecture mismatch"):
+        load_finetune_checkpoint(incompatible, path, class_names=["car", "person"],
+                                checkpoint_classes=classes)
+
+
+def test_explicit_taxonomy_resume_rejects_equal_size_reorder(tmp_path):
+    trainer = Trainer.__new__(Trainer)
+    trainer.exp = SimpleNamespace(class_names=["car", "person"])
+    checkpoint = tmp_path / "custom.pth"
+    torch.save({"model": {}}, checkpoint)
+    classes = tmp_path / "classes.json"
+    classes.write_text('["person", "car"]')
+    trainer.args = SimpleNamespace(resume=True, ckpt=checkpoint, prepared_data="prepared",
+                                   checkpoint_classes=classes)
+    with pytest.raises(ValueError, match="identical ordered classes"):
+        trainer.resume_train(nn.Linear(2, 2))

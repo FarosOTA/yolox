@@ -24,6 +24,33 @@ ONNX models with the locked export environment and retain their hashes along
 with preprocessing size, decoder settings, and label order. TensorRT engines
 are target-runtime/GPU-specific; do not distribute one as a portable model.
 
+## Official checkpoint recognition
+
+Explicit-taxonomy fine-tuning recognizes the exact upstream release files below
+using the SHA-256 registry in `yolox/utils/checkpoint.py`. All six were downloaded
+over HTTPS from the listed release on 2026-11-23 and hashed locally; these are
+approved file identities, not publisher signatures or new accuracy benchmarks.
+Other releases or reserialized copies require an explicit original class list.
+No class metadata is written into checkpoint files.
+
+Publisher URL prefix:
+`https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/`
+
+| File | SHA-256 |
+| --- | --- |
+| `yolox_nano.pth` | `cd28f55fbbc1829f99d9ac9b38a16d259a22889739c8728ea877610201feff7b` |
+| `yolox_tiny.pth` | `9de513de589ac98bb92d3bca53b5af7b9acfa9b0bacb831f7999d0f7afaee8f0` |
+| `yolox_s.pth` | `f55ded7181e1b0c13285c56e7790b8f0e8f8db590fe4edb37f0b7f345c913a30` |
+| `yolox_m.pth` | `60076992b32da82951c90cfa7bd6ab70eba9eda243e08b940a396f60ac2d19b6` |
+| `yolox_l.pth` | `1e6b7fa6240375370b2a8a8eab9066b3cdd43fd1d0bfa8d2027fd3a51def2917` |
+| `yolox_x.pth` | `5652330b6ae860043f091b8f550a60c10e1129f416edfdb65c259be6caf355cf` |
+
+The downloader still skips existing nonempty files without checking integrity;
+explicit-taxonomy loading checks the actual digest independently. A custom
+checkpoint with 80 classes is never identified as official from its shape.
+See the [class mapping guide](cvat_training_data.md#explicit-taxonomy-and-pretrained-class-initialization)
+for custom checkpoint declarations and their limitations.
+
 ## MegEngine validation (2026-10-26)
 
 The optional legacy exporter was isolated from the main uv environment:

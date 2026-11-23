@@ -17,10 +17,32 @@ server = "192.0.2.10"
 model = "yolox-nano"
 # Optional COCO-pretrained weights; omit to train from scratch.
 # checkpoint = "weights/yolox_nano.pth"
+# WARNING: With classes.names, only an exact registered official SHA-256 implies
+# COCO class order. A filename or 80-class head proves nothing. Custom/unknown
+# checkpoints require their ORIGINAL run's classes.json, not the new target list:
+# checkpoint_classes = "datasets/cvat-runs/previous/classes.json"
+# No class metadata is added to checkpoints. A wrong source list cannot be
+# detected if its length matches; keep the original classes.json with its weights.
+# Resume requires the identical original class order; changed taxonomies must
+# fine-tune instead. See docs/cvat_training_data.md for the lower-level resume CLI.
 
-# Optional: exclude original labels; their boxes become unlabelled/background.
+# Optional explicit taxonomy: order = model class IDs; all classes must be
+# annotated normally in the dataset. Unmapped official-checkpoint rows start fresh.
 # [classes]
+# names = ["linear_cracking", "road_sign", "traffic_signal", "person", "vehicle"]
+# Optional: exclude original labels; their boxes become unlabelled/background.
 # exclude = ["cone"]
+
+# Optional: target taxonomy name = exact COCO source string or array (weights only).
+# Arrays must be non-empty and unique. Multiple rows' weights/biases are averaged
+# as a warm start, not an exact union detector; normal annotations teach the merge.
+# Requires classes.names and training.checkpoint. On custom starts, matching
+# fine-tuned names win; these mappings do not reset them to COCO or rename labels.
+# [classes.init_from_coco]
+# road_sign = "stop sign"
+# traffic_signal = "traffic light"
+# person = "person"
+# vehicle = ["car", "bus", "truck"]
 
 # Optional: target class = source labels. An existing label named like a target
 # is excluded unless listed as a source.

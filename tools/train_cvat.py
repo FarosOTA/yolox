@@ -37,8 +37,9 @@ def load_config(path):
                     "validation_workers": (int,), "full_decode": (bool,)},
         "training": {"model": (str,), "exp_file": (str,), "devices": (int,), "batch": (int,),
                      "fp16": (bool,), "cache": (str,), "checkpoint": (str,),
-                     "overrides": (dict,)},
-        "classes": {"merge": (dict,), "exclude": (list,)},
+                     "checkpoint_classes": (str,), "overrides": (dict,)},
+        "classes": {"merge": (dict,), "exclude": (list,), "names": (list,),
+                    "init_from_coco": (dict,)},
     }
     defaults = {
         "cvat": {},
@@ -106,15 +107,27 @@ def load_config(path):
     if "exp_file" not in training:
         training.setdefault("model", "yolox-nano")
     for table, key in ((nfs, "frame_root"), (dataset, "output_dir"),
-                       (training, "exp_file"), (training, "checkpoint")):
+                       (training, "exp_file"), (training, "checkpoint"),
+                       (training, "checkpoint_classes")):
         if key in table:
             table[key] = str((path.parent / Path(table[key]).expanduser()).resolve())
     class_merge_sources(config["classes"]["merge"], config["classes"]["exclude"])
+    classes = config["classes"]
+    if "names" in classes:
+        from yolox.utils.checkpoint import checkpoint_class_names, validate_class_initialization
+        validate_class_initialization(classes["names"], classes.get("init_from_coco", {}))
+        if "checkpoint" in training:
+            checkpoint_class_names(training["checkpoint"], training.get("checkpoint_classes"))
+        elif "checkpoint_classes" in training or classes.get("init_from_coco"):
+            raise ValueError("Class initialization requires training.checkpoint")
+    elif "init_from_coco" in classes or "checkpoint_classes" in training:
+        raise ValueError("Class initialization requires classes.names")
     exp = get_exp(training.get("exp_file"), training.get("model"))
     for key, value in training["overrides"].items():
         if key not in vars(exp):
             raise ValueError(f"Unknown training.overrides key: {key}")
-        if key in {"data_dir", "train_ann", "val_ann", "test_ann", "num_classes", "output_dir"}:
+        if key in {"data_dir", "train_ann", "val_ann", "test_ann", "num_classes", "output_dir",
+                   "class_names", "init_from_coco"}:
             raise ValueError(f"training.overrides.{key} is managed by the workflow")
         if type(value) not in (str, int, float, bool, list):
             raise ValueError(f"Unsupported training.overrides value for {key}")
@@ -132,6 +145,8 @@ def training_arguments(config, output):
         args += ["--cache", training["cache"]]
     if "checkpoint" in training:
         args += ["-c", training["checkpoint"]]
+    if "checkpoint_classes" in training:
+        args += ["--checkpoint-classes", training["checkpoint_classes"]]
     args += [part for key, value in training["overrides"].items() for part in (key, str(value))]
     return args + ["output_dir", str(output / "training")]
 
@@ -303,6 +318,8 @@ def run_training(config):
         prepare_dataset(cvat["host"], cvat.get("project_id"), root, output,
                         seed=dataset["seed"], merge=config["classes"]["merge"],
                         exclude=config["classes"]["exclude"],
+                        names=config["classes"].get("names"),
+                        init_from_coco=config["classes"].get("init_from_coco"),
                         nfs_server=nfs["server"], nfs_export=nfs["export"], data=data,
                         workers=dataset["validation_workers"], full_decode=dataset["full_decode"],
                         validation_token=validation_token, report=report,

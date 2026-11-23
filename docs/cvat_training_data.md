@@ -66,10 +66,12 @@ such as `datasets/cvat-runs` and `weights/yolox_nano.pth`, without `../../`.
 | `cvat` | Required HTTPS `host` and non-empty `task_ids` array of unique positive integers. The template's IDs are fixtures; replace them with your tasks. Only selected tasks are exported and combined, then split 70/15/15 by image count. Legacy positive integer `project_id` is an alternative, never combined with `task_ids`. Keep the hostname for TLS; no credentials, path or query in the URL. |
 | `nfs` | Required LAN IPv4 `server`; `export` defaults to `/`; `options` defaults to `["ro", "vers=4.2", "proto=tcp"]`. These three options are mandatory; only `nosuid`, `nodev`, `noexec`, `hard` may be added. Optional `frame_root` reuses an existing mount and never mounts/unmounts it. |
 | `dataset` | Local `output_dir` base (default `datasets/cvat-runs`), integer split `seed` (default 0), `validation_workers` (16, allowed 1–128), `full_decode` (false). The image split is fixed at 70/15/15; the old `val_fraction` setting is rejected. Each invocation creates a unique UTC timestamp/UUID run folder. |
-| `training` | `model` (default `yolox-nano`) **or** `exp_file`, `devices` (1), `batch` (8), `fp16` (false), `cache` (`disk`, `ram` or `none`), optional `checkpoint` for fine-tuning. There is no `resume` setting. |
+| `training` | `model` (default `yolox-nano`) **or** `exp_file`, `devices` (1), `batch` (8), `fp16` (false), `cache` (`disk`, `ram` or `none`), optional `checkpoint` for fine-tuning. With `classes.names`, custom checkpoints require `checkpoint_classes`, the original run's ordered JSON class list. There is no `resume` setting. |
 | `training.overrides` | Experiment settings such as `max_epoch = 100`, `input_size = [640, 640]` and `data_num_workers = 4`. The example omits overrides, keeping the selected experiment's defaults (300 epochs for Nano). Dataset paths, class count and output directory are managed by the workflow, not overridable here. |
 | `classes.exclude` | Optional array of original CVAT labels to remove (default empty). Images remain, but their excluded boxes become unlabelled/background. |
 | `classes.merge` | Optional target-class groups as described below. Exclusions cannot overlap group sources. |
+| `classes.names` | Optional nonempty unique target names in model-index order. After merges/exclusions, dataset category names must match this list. |
+| `classes.init_from_coco` | Optional target name = exact `COCO_CLASSES` source string or nonempty array of unique source names. Multiple rows' weights/biases are averaged as an approximate initializer. Requires `classes.names` and `training.checkpoint`; affects classifier weights, not annotation names. |
 
 Model checkpoints/logs go under `<run>/training`. Disk caches stay in the
 local run folder, not on NFS. Every supervisor invocation starts a new run:
@@ -127,6 +129,87 @@ Every box of retained labels is preserved. The final source-to-class mapping
 is printed and saved; excluded source labels have `null` for `class`,
 `category_id` and `class_index`. `resolved_config.json` also records the exact
 exclusion list and merge groups.
+
+### Explicit taxonomy and pretrained class initialization
+
+For normally annotated target classes, configure the output order and the
+pretrained starting rows independently of annotation merging:
+
+```toml
+[training]
+model = "yolox-nano"
+checkpoint = "weights/yolox_nano.pth"
+
+[classes]
+names = ["linear_cracking", "road_sign", "traffic_signal", "person", "vehicle"]
+
+[classes.init_from_coco]
+road_sign = "stop sign"
+traffic_signal = "traffic light"
+person = "person"
+vehicle = ["car", "bus", "truck"]
+```
+
+With `classes.names`, preparation assigns category IDs 1–N in that order and
+rewrites every annotation; model indices are 0–N−1. This overrides the default
+source-ID-derived order above. All surviving source categories after merges and
+exclusions must match the target names, including categories with no boxes in
+a split. Every target class must be annotated normally wherever present; this
+feature does not generate labels or prove annotation completeness.
+
+Only the exact official release bytes in the
+[SHA-256 registry](model_assets.md#official-checkpoint-recognition) imply COCO
+order. Renaming the file is harmless; modifying or reserializing it changes its
+digest. An 80-class head, filename or absence of metadata is not evidence of
+COCO class meanings. Classifier weight/bias rows are copied at all three FPN
+levels, while shared feature, regression and objectness tensors load from the
+primary checkpoint. Unmapped target rows retain random weights and prior bias
+at probability 0.01. Compatible architecture keys/shapes are required; a Nano
+checkpoint cannot initialize an S/X model through partial loading in this mode.
+
+For custom/unknown checkpoints, set this under `[training]`:
+
+```toml
+checkpoint = "datasets/cvat-runs/previous/training/yolox_nano/best_ckpt.pth"
+checkpoint_classes = "datasets/cvat-runs/previous/classes.json"
+```
+
+**Warning:** that JSON must be the checkpoint's original class order, not the
+new target list. A wrong same-length list cannot be detected. No hand-rolled
+class metadata is added to `.pth` files; preserve the original `classes.json`
+with the weights. Unknown checkpoints without this declaration are refused in
+explicit-taxonomy mode. Paths resolve relative to the TOML file.
+
+Custom rows are remapped by exact target name, so reordered/removed classes are
+handled and existing fine-tuned rows win over historical COCO mappings. A new
+unmapped class starts fresh. A missing custom class with a COCO initializer
+fails explicitly: this first implementation does not load a second official
+donor into a drifted custom feature space. Remove that initializer to start the
+new row fresh, or start the run from the official checkpoint. Renames are not
+inferred; they count as new classes. Force-COCO resets and cross-checkpoint
+donors are not implemented.
+
+Each target accepts one source string or a nonempty array of unique source
+strings. A string and a one-element array copy exactly the same weight/bias row.
+For multiple sources, the arithmetic mean of their classifier weight rows and
+biases initializes the target at each of the three FPN levels. This is an
+approximation, not an exact union of source predictions; the loader logs a
+warning, and normally annotated merged-category boxes teach the final detector.
+Source order has no semantic significance. Empty arrays, duplicate names,
+non-string entries and unknown COCO names fail config validation.
+
+Use exact names such as `motorcycle`, not `motorbike`. `stop sign` initializes
+only a useful starting point for broader `road_sign` semantics; normal
+annotations must teach the other sign types. Annotation merging remains a
+separate operation. Custom checkpoint rows still win by target name regardless
+of whether their historical COCO initializer is a string or an array.
+
+Existing configs without `classes.names` retain legacy shape-based loading,
+including its inability to recognize class reorderings. Class retention and
+privacy recall need measurement on held-out hand-labelled data; copied weights
+alone do not guarantee either. Export still requires the correct experiment
+class count, and custom inference callers must supply the target label names;
+this change does not alter the standalone demo's COCO display-name default.
 
 ## Credentials and temporary export
 
@@ -443,6 +526,14 @@ uv run --no-sync python tools/train.py -n yolox-nano -d 1 -b 8 \
   --prepared-data datasets/prepared-cvat --cache disk \
   --resume -c path/to/latest_ckpt.pth
 ```
+
+For data prepared with explicit `classes.names`, also pass
+`--checkpoint-classes path/to/original/classes.json` for custom checkpoints.
+Resume checks that the source names exactly equal the prepared target order
+before restoring optimizer state. A changed taxonomy must fine-tune without
+`--resume`; class initialization mappings are not reapplied during resume.
+Without checkpoint class metadata, the source JSON is a user declaration and
+the code cannot detect a wrong same-length list or a semantic definition change.
 
 This is distinct from initializing a fresh supervised run with COCO weights.
 Temporary mounts removed by the supervisor are not persistent prepared data;

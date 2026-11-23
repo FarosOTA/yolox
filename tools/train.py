@@ -52,6 +52,11 @@ def make_parser():
     )
     parser.add_argument("-c", "--ckpt", default=None, type=str, help="checkpoint file")
     parser.add_argument(
+        "--checkpoint-classes", default=None,
+        help="Original checkpoint's classes.json for explicit-taxonomy prepared data; "
+             "required for unrecognized custom checkpoints, including resume",
+    )
+    parser.add_argument(
         "-e",
         "--start_epoch",
         default=None,

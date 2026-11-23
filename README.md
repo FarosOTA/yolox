@@ -223,6 +223,20 @@ download. There is no `training.resume` setting. To continue interrupted
 training, use the existing training CLI's `--resume` with an explicit checkpoint
 and persistent prepared data as described in the guide.
 
+Optional `classes.names` sets the custom model's output order;
+`[classes.init_from_coco]` maps target names to exact COCO source names for
+classifier-row initialization. Each value accepts a string or nonempty array of
+unique names, such as `vehicle = ["car", "bus", "truck"]`. Multiple source rows'
+weights and biases are averaged as an approximate warm start, not an exact
+union of detections. All target classes must be annotated normally.
+Only exact registered SHA-256 hashes identify official Nano/Tiny/S/M/L/X release
+checkpoints. Custom/unknown files require `training.checkpoint_classes` pointing
+to their original run's `classes.json`; a filename or 80-class head does not
+identify the taxonomy. No class metadata is added to checkpoint files.
+Custom fine-tuned rows win by name, and resume requires unchanged class order.
+See [class initialization and checkpoint warnings](docs/cvat_training_data.md#explicit-taxonomy-and-pretrained-class-initialization).
+Without `classes.names`, existing shape-based fine-tuning remains unchanged.
+
 The supervisor checks LAN routes, NFS source/options, exported image headers,
 class mapping and local cache capacity before training. Flushed phase messages,
 export-download and image-validation progress bars, and elapsed timings make

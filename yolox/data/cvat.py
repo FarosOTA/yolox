@@ -572,22 +572,26 @@ def class_merge_sources(groups, exclude=()):
     return sources
 
 
-def merge_classes(data, merge, exclude=()):
-    """First occurrence in ascending source-id order owns each final class."""
+def merge_classes(data, merge, exclude=(), names=None):
+    """Use explicit target order, or first occurrence in ascending source-id order."""
+    if names is not None:
+        from yolox.utils.checkpoint import validate_class_names
+        validate_class_names(names)
     sources = class_merge_sources(merge, exclude)
     categories = sorted(data["categories"], key=lambda category: category["id"])
-    names = [category["name"] for category in categories]
-    if len(set(names)) != len(names):
+    source_names = [category["name"] for category in categories]
+    if len(set(source_names)) != len(source_names):
         raise ValueError("CVAT category names must be unique for class mapping")
-    unknown = set(sources) - set(names)
+    unknown = set(sources) - set(source_names)
     if unknown:
         raise ValueError(f"Unknown CVAT labels in classes.merge: {', '.join(sorted(unknown))}")
-    unknown = set(exclude) - set(names)
+    unknown = set(exclude) - set(source_names)
     if unknown:
         raise ValueError(f"Unknown CVAT labels in classes.exclude: {', '.join(sorted(unknown))}")
     # An existing label named like a target is excluded unless some group lists it as a source.
-    exclude = set(exclude) | {target for target in merge if target in names and target not in sources}
-    classes, remap, mapping = {}, {}, []
+    exclude = set(exclude) | {target for target in merge if target in source_names and target not in sources}
+    classes = {name: index + 1 for index, name in enumerate(names or [])}
+    remap, mapping = {}, []
     for category in categories:
         if category["name"] in exclude:
             mapping.append({"source_id": category["id"], "source": category["name"],
@@ -595,14 +599,20 @@ def merge_classes(data, merge, exclude=()):
             continue
         name = sources.get(category["name"], category["name"])
         if name not in classes:
+            if names is not None:
+                raise ValueError(f"Dataset class {name!r} is absent from classes.names")
             classes[name] = len(classes) + 1
-        target_id = classes[name] if merge or exclude else category["id"]
+        target_id = classes[name] if merge or exclude or names is not None else category["id"]
         remap[category["id"]] = target_id
         mapping.append({"source_id": category["id"], "source": category["name"],
                         "class": name, "category_id": target_id, "class_index": classes[name] - 1})
     if not classes:
         raise ValueError("classes.exclude must leave at least one class")
-    if merge or exclude:
+    if names is not None:
+        missing = set(names) - {item["class"] for item in mapping}
+        if missing:
+            raise ValueError("classes.names missing from dataset categories: " + ", ".join(sorted(missing)))
+    if merge or exclude or names is not None:
         data["categories"] = [{"id": id_, "name": name} for name, id_ in classes.items()]
         data["annotations"] = [annotation for annotation in data["annotations"]
                                if annotation["category_id"] in remap]
@@ -617,7 +627,7 @@ def merge_classes(data, merge, exclude=()):
 def prepare_dataset(cvat_host, project_id, frame_root, output, *, seed=0,
                     nfs_server, merge=None, exclude=(), nfs_export="/", data=None,
                     workers=16, full_decode=False, validation_token=None, report=None,
-                    task_ids=None):
+                    task_ids=None, names=None, init_from_coco=None):
     if report is not None:
         report.start_phase("Mounted source preflight")
     cvat_hostname(cvat_host)
@@ -638,7 +648,12 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, *, seed=0,
                          stats=validation_stats, skip_invalid=True)
     if report is not None:
         report.start_phase("Class mapping and 70/15/15 split")
-    mapping = merge_classes(data, merge or {}, exclude)
+    if names is not None:
+        from yolox.utils.checkpoint import validate_class_initialization
+        validate_class_initialization(names, init_from_coco or {})
+    elif init_from_coco:
+        raise ValueError("classes.init_from_coco requires classes.names")
+    mapping = merge_classes(data, merge or {}, exclude, names)
     splits = split_dataset(data, seed)
     rides = {split: sorted({PurePosixPath(image["file_name"]).parts[0] for image in images})
              for split, images in splits.items()}
@@ -686,6 +701,9 @@ def prepare_dataset(cvat_host, project_id, frame_root, output, *, seed=0,
         **{f"{split}_rides": names for split, names in rides.items()},
         "validation_workers": workers, "full_decode": full_decode,
     }
+    if names is not None:
+        manifest["explicit_class_names"] = True
+        manifest["init_from_coco"] = init_from_coco or {}
     if task_ids is not None:
         manifest.pop("project_id")
         manifest["task_ids"] = task_ids
@@ -767,3 +785,8 @@ def configure_training(exp, directory, *, cache=None, evaluation_split="val"):
     exp.val_ann = SPLIT_FILES[evaluation_split]
     exp.test_ann = TEST_JSON
     exp.num_classes = manifest["num_classes"]
+    if manifest.get("explicit_class_names"):
+        exp.class_names = json.loads((Path(directory) / "classes.json").read_text())
+        exp.init_from_coco = manifest.get("init_from_coco", {})
+        from yolox.utils.checkpoint import validate_class_initialization
+        validate_class_initialization(exp.class_names, exp.init_from_coco)
