@@ -249,7 +249,8 @@ Run records, cache and checkpoints stay in unique local run folders. Optional
 `[classes] exclude = ["cone"]` removes original CVAT labels and their boxes
 from both splits while retaining all images: excluded objects become background,
 not ignore regions. Optional `[classes.merge]` groups combine retained labels;
-exclusions cannot overlap merge sources or targets. The saved mapping records
+exclusions cannot overlap merge sources, and an existing label named like a
+target is excluded unless a group lists it as a source. The saved mapping records
 excluded labels and final class indices for loaders and evaluation.
 `tools/prepare_cvat.py` offers standalone
 preparation and preflight checks. Networking/mounts are fixture-tested; a live

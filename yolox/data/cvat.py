@@ -566,10 +566,9 @@ def class_merge_sources(groups, exclude=()):
             or any(not isinstance(label, str) or not label.strip() for label in exclude)
             or len(set(exclude)) != len(exclude)):
         raise ValueError("classes.exclude must be an array of unique non-empty source label names")
-    overlap = set(exclude) & (set(sources) | set(groups))
+    overlap = set(exclude) & set(sources)
     if overlap:
-        raise ValueError("classes.exclude overlaps merge sources or targets: "
-                         + ", ".join(sorted(overlap)))
+        raise ValueError("classes.exclude overlaps merge sources: " + ", ".join(sorted(overlap)))
     return sources
 
 
@@ -586,10 +585,8 @@ def merge_classes(data, merge, exclude=()):
     unknown = set(exclude) - set(names)
     if unknown:
         raise ValueError(f"Unknown CVAT labels in classes.exclude: {', '.join(sorted(unknown))}")
-    for target, labels in merge.items():
-        if target in names and target not in labels:
-            raise ValueError(f"Merge target {target!r} is an existing CVAT label; "
-                             "include it explicitly in its own group to merge it")
+    # An existing label named like a target is excluded unless some group lists it as a source.
+    exclude = set(exclude) | {target for target in merge if target in names and target not in sources}
     classes, remap, mapping = {}, {}, []
     for category in categories:
         if category["name"] in exclude:

@@ -733,8 +733,7 @@ def test_supervisor_never_unmounts_existing_root(lan, synthetic, monkeypatch, ru
     ('[classes]\nexclude = [2]', "unique non-empty source label names"),
     ('[classes]\nexclude = ["car", "car"]', "unique non-empty source label names"),
     ('[classes]\nexclude = [" "]', "unique non-empty source label names"),
-    ('[classes]\nexclude = ["car"]\n[classes.merge]\nvehicle = ["car"]', "overlaps merge sources or targets: car"),
-    ('[classes]\nexclude = ["vehicle"]\n[classes.merge]\nvehicle = ["car"]', "overlaps merge sources or targets: vehicle"),
+    ('[classes]\nexclude = ["car"]\n[classes.merge]\nvehicle = ["car"]', "overlaps merge sources: car"),
 ])
 def test_config_rejects_typos_and_invalid_settings(tmp_path, extra, message):
     from tools.train_cvat import load_config
@@ -916,7 +915,6 @@ def test_grouped_merge_run_records_loaders_and_evaluation(lan, grouped_export, r
     ({"vehicle": ["car", "typo"]}, [], "Unknown CVAT labels.*typo"),
     ({"vehicle": ["car"], "other": ["car"]}, [], "'car'.*'vehicle'.*'other'"),
     ({"vehicle": []}, [], "non-empty array"),
-    ({"vehicle": ["car"]}, [], "'vehicle'.*existing CVAT label"),
     ({}, ["typo"], "Unknown CVAT labels in classes.exclude: typo"),
     ({}, ["car", "person", "truck", "bicycle", "motorcycle", "cone", "bus", "vehicle"], "leave at least one class"),
 ])
@@ -927,6 +925,21 @@ def test_invalid_class_groups_fail_before_prepared_output(lan, grouped_export, t
     with pytest.raises(ValueError, match=message):
         cvat.prepare_dataset(HOST, 42, lan.root, output, merge=merge, exclude=exclude, nfs_server="192.0.2.10")
     assert not output.exists()
+
+
+@pytest.mark.parametrize("exclude", [[], ["vehicle"]])
+def test_existing_label_named_like_target_is_excluded(grouped_export, exclude):
+    # The existing "vehicle" label is dropped, not merged, unless a group lists it as a source.
+    vehicle_boxes = sum(a["category_id"] == 15 for a in grouped_export["annotations"])
+    total = len(grouped_export["annotations"])
+    mapping = cvat.merge_classes(grouped_export, {"vehicle": ["car", "truck", "bus"]}, exclude)
+    assert [(entry["source"], entry["class"]) for entry in mapping] == [
+        ("car", "vehicle"), ("person", "person"), ("truck", "vehicle"), ("bicycle", "bicycle"),
+        ("motorcycle", "motorcycle"), ("cone", "cone"), ("bus", "vehicle"), ("vehicle", None),
+    ]
+    assert [c["name"] for c in grouped_export["categories"]] == [
+        "vehicle", "person", "bicycle", "motorcycle", "cone"]
+    assert len(grouped_export["annotations"]) == total - vehicle_boxes
 
 
 def test_exclusion_without_merges_keeps_empty_images(lan, synthetic, tmp_path, monkeypatch):

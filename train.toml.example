@@ -22,7 +22,8 @@ model = "yolox-nano"
 # [classes]
 # exclude = ["cone"]
 
-# Optional: target class = source labels.
+# Optional: target class = source labels. An existing label named like a target
+# is excluded unless listed as a source.
 # [classes.merge]
 # vehicle = ["car", "truck", "bus"]
 # two_wheeler = ["bicycle", "motorcycle"]

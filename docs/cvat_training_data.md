@@ -69,7 +69,7 @@ such as `datasets/cvat-runs` and `weights/yolox_nano.pth`, without `../../`.
 | `training` | `model` (default `yolox-nano`) **or** `exp_file`, `devices` (1), `batch` (8), `fp16` (false), `cache` (`disk`, `ram` or `none`), optional `checkpoint` for fine-tuning. There is no `resume` setting. |
 | `training.overrides` | Experiment settings such as `max_epoch = 100`, `input_size = [640, 640]` and `data_num_workers = 4`. The example omits overrides, keeping the selected experiment's defaults (300 epochs for Nano). Dataset paths, class count and output directory are managed by the workflow, not overridable here. |
 | `classes.exclude` | Optional array of original CVAT labels to remove (default empty). Images remain, but their excluded boxes become unlabelled/background. |
-| `classes.merge` | Optional target-class groups as described below. Exclusions cannot overlap group sources or targets. |
+| `classes.merge` | Optional target-class groups as described below. Exclusions cannot overlap group sources. |
 
 Model checkpoints/logs go under `<run>/training`. Disk caches stay in the
 local run folder, not on NFS. Every supervisor invocation starts a new run:
@@ -100,12 +100,15 @@ this is **not** an ignore-region mechanism. No source images or CVAT annotations
 are modified on the server. Omit `classes.exclude` to preserve all classes.
 
 Unknown or duplicate exclusions, empty/non-string label names, overlap with any
-merge source or target, and exclusions leaving no classes fail explicitly.
+merge source, and exclusions leaving no classes fail explicitly.
 Unlisted labels retain their names. Unknown source labels, empty groups and
-sources appearing in multiple groups fail with explicit errors. An existing
-CVAT label cannot be a target unless explicitly listed in its own group:
-if `vehicle` already exists, use `vehicle = ["vehicle", "car", "truck", "bus"]`.
-This prevents accidental merging of an untouched class into a group.
+sources appearing in multiple groups fail with explicit errors. If an existing
+CVAT label has the same name as a merge target and no group lists it as a
+source, it is **excluded automatically**: with `vehicle = ["car", "truck", "bus"]`,
+the original `vehicle` label's boxes become background and the final `vehicle`
+class contains only `car`, `truck` and `bus` boxes. Listing it in an exclusion
+as well is allowed but redundant. To keep those boxes, list the label as a
+source: `vehicle = ["vehicle", "car", "truck", "bus"]`.
 
 Class order follows the **first occurrence of each final class while walking
 original categories in ascending CVAT category-id order**. It does not depend
